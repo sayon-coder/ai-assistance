@@ -21,7 +21,9 @@ class SetupWizard(QDialog):
         self.runtime = runtime
         self.setWindowTitle("Welcome to NOVA")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setObjectName("Root")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(theme.STYLESHEET)
         self.setModal(True)
         self.setFixedSize(640, 520)
         self._build()
@@ -34,7 +36,7 @@ class SetupWizard(QDialog):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(0, 0, 0, 0)
         shell = QFrame()
         shell.setObjectName("Shell")
         outer.addWidget(shell)

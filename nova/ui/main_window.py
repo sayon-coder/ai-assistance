@@ -12,8 +12,8 @@ from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizeGrip, QSlider,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import startup
@@ -24,6 +24,7 @@ from ..runtime import NovaRuntime
 from ..voice import measure_input
 from . import theme
 from .components import Card, Divider, FacePreview, Heading, StatusText, Switch, footnote, muted
+from .custom_editor import CustomEditor
 from .mode_editor import ModeEditor
 
 log = logging.getLogger("nova.ui")
@@ -33,6 +34,7 @@ PAGES = [
     ("study", "Study Mode"),
     ("entertainment", "Entertainment Mode"),
     ("voice", "Voice Settings"),
+    ("commands", "Custom Commands & Automations"),
     ("appearance", "Appearance"),
     ("monitoring", "Application Monitoring"),
     ("startup", "Startup Settings"),
@@ -73,7 +75,8 @@ class MainWindow(QWidget):
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "nova_icon.png")))
         self.setObjectName("Root")
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(theme.STYLESHEET)
         self.setMinimumSize(980, 660)
         self.resize(1060, 740)
         self._build()
@@ -118,6 +121,7 @@ class MainWindow(QWidget):
                 "Everything opened by “NOVA, get ready for my entertainment mode”.",
             ),
             "voice": self._page_voice(),
+            "commands": self._page_commands(),
             "appearance": self._page_appearance(),
             "monitoring": self._page_monitoring(),
             "startup": self._page_startup(),
@@ -126,6 +130,10 @@ class MainWindow(QWidget):
         for key, _label in PAGES:
             self.stack.addWidget(self.pages[key])
         self.show_page("dashboard")
+
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setFixedSize(16, 16)
+        self.size_grip.raise_()
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -217,7 +225,6 @@ class MainWindow(QWidget):
         area.setFrameShape(QFrame.Shape.NoFrame)
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         area.setWidget(page)
-        area.setStyleSheet("background: transparent;")
         return area
 
     # =====================================================================
@@ -232,20 +239,24 @@ class MainWindow(QWidget):
         grid = QGridLayout()
         grid.setSpacing(12)
         self.stat_widgets: dict[str, StatusText] = {}
-        for position, (title, key) in enumerate((
-            ("Voice input", "voice"),
+        cards = (
+            ("NOVA", "running"),
+            ("Listening", "wake"),
+            ("Microphone", "microphone"),
             ("Spoken output", "speech"),
+            ("Active mode", "active_mode"),
             ("OpenCode", "opencode"),
             ("Codex Desktop", "codex"),
-        )):
+        )
+        for position, (title, key) in enumerate(cards):
             card = Card(title)
             status = StatusText("…")
             card.add(status)
             self.stat_widgets[key] = status
-            grid.addWidget(card, position // 2, position % 2)
+            grid.addWidget(card, position // 3, position % 3)
         layout.addLayout(grid)
 
-        actions = Card("Quick actions", "Speech mute and application monitoring are independent.")
+        actions = Card("Quick actions", "Every button below uses the real runtime service.")
         first = QHBoxLayout()
         first.setSpacing(8)
         study = QPushButton("Study Mode")
@@ -266,23 +277,50 @@ class MainWindow(QWidget):
         second.setSpacing(8)
         self.mute_button = QPushButton("Mute voice")
         self.mute_button.clicked.connect(self._toggle_mute)
-        self.test_button = QPushButton("Test voice")
-        self.test_button.clicked.connect(self.runtime.test_voice)
+        self.test_mic_button = QPushButton("Test microphone")
+        self.test_mic_button.clicked.connect(self._check_microphone)
+        voice_settings = QPushButton("Open Voice Settings")
+        voice_settings.clicked.connect(lambda: self.show_page("voice"))
+        second.addWidget(self.mute_button)
+        second.addWidget(self.test_mic_button)
+        second.addWidget(voice_settings)
         self.face_quick = QPushButton("Hide face")
         self.face_quick.clicked.connect(self._toggle_face)
-        second.addWidget(self.mute_button)
-        second.addWidget(self.test_button)
         second.addWidget(self.face_quick)
         second.addStretch(1)
         actions.add_layout(second)
         layout.addWidget(actions)
 
+        interaction = Card(
+            "Last voice interaction",
+            "Only real transcripts and executed actions are shown here.",
+        )
+        self.last_heard_label = QLabel("Nothing recognised yet.")
+        self.last_command_label = QLabel("No command executed yet.")
+        self.last_result_label = QLabel("No result yet.")
+        for label in (self.last_heard_label, self.last_command_label, self.last_result_label):
+            label.setWordWrap(True)
+            label.setStyleSheet("font-size: 10pt; color: #E8E8E8;")
+        interaction.add(QLabel("Recognised sentence"))
+        interaction.add(self.last_heard_label)
+        interaction.add(QLabel("Executed command"))
+        interaction.add(self.last_command_label)
+        interaction.add(QLabel("Result"))
+        interaction.add(self.last_result_label)
+        layout.addWidget(interaction)
+
         recent = Card("Recent activity")
+        self.activity_label = QLabel("No activity yet.")
+        self.activity_label.setWordWrap(True)
+        self.activity_label.setStyleSheet("font-size: 9.5pt; color: #D8D8D8;")
+        recent.add(self.activity_label)
         self.last_event = QLabel("NOVA is ready.")
         self.last_event.setWordWrap(True)
-        self.last_event.setStyleSheet("font-size: 10pt; color: #CFE0F5;")
+        self.last_event.setObjectName("Muted")
         recent.add(self.last_event)
-        recent.add(footnote("Coding notifications come only from real OpenCode events and recorded Codex turns."))
+        recent.add(footnote(
+            "Coding notifications come only from real OpenCode events and recorded Codex turns."
+        ))
         layout.addWidget(recent)
         layout.addStretch(1)
         return self._scroll(page)
@@ -347,13 +385,23 @@ class MainWindow(QWidget):
         ))
         layout.addWidget(output)
 
-        wake = Card("Wake word and microphone", "Say “NOVA”, wait for the acknowledgement, then speak your command.")
+        wake = Card(
+            "Listening and microphone",
+            "NOVA can listen continuously, or wait for the word “NOVA”. Commands are matched exactly.",
+        )
         wake_row = QHBoxLayout()
-        wake_row.addWidget(QLabel("Listen for the wake word “NOVA”"))
+        wake_row.addWidget(QLabel("Enable voice input"))
         wake_row.addStretch(1)
         self.wake_switch = Switch()
         wake_row.addWidget(self.wake_switch)
         wake.add_layout(wake_row)
+
+        always_row = QHBoxLayout()
+        always_row.addWidget(QLabel("Listen continuously (no wake word)"))
+        always_row.addStretch(1)
+        self.always_switch = Switch()
+        always_row.addWidget(self.always_switch)
+        wake.add_layout(always_row)
         self.voice_status = StatusText("Starting…")
         wake.add(self.voice_status)
 
@@ -398,6 +446,45 @@ class MainWindow(QWidget):
         wake.add(self.model_note)
         layout.addWidget(wake)
 
+        diagnostics = Card(
+            "Voice diagnostics",
+            "Real recognition state only. Partial results are not shown and no audio is stored.",
+        )
+        self.diag_wake = StatusText("Checking…")
+        diagnostics.add(QLabel("Listening state"))
+        diagnostics.add(self.diag_wake)
+        self.diag_heard = QLabel("Nothing recognised yet.")
+        self.diag_command = QLabel("No command executed yet.")
+        self.diag_result = QLabel("No result yet.")
+        self.diag_error = QLabel("No microphone or recognition errors.")
+        for label in (self.diag_heard, self.diag_command, self.diag_result, self.diag_error):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        diagnostics.add(QLabel("Last recognised sentence"))
+        diagnostics.add(self.diag_heard)
+        diagnostics.add(QLabel("Last executed command"))
+        diagnostics.add(self.diag_command)
+        diagnostics.add(QLabel("Last command result"))
+        diagnostics.add(self.diag_result)
+        diagnostics.add(QLabel("Microphone and recognition errors"))
+        diagnostics.add(self.diag_error)
+        diag_actions = QHBoxLayout()
+        diag_listen = QPushButton("Listen now")
+        diag_listen.clicked.connect(self.runtime.listen_now)
+        diag_test_voice = QPushButton("Test voice")
+        diag_test_voice.clicked.connect(self.runtime.test_voice)
+        open_log = QPushButton("Open NOVA log")
+        open_log.clicked.connect(self._open_log)
+        diag_actions.addWidget(diag_listen)
+        diag_actions.addWidget(diag_test_voice)
+        diag_actions.addWidget(open_log)
+        diag_actions.addStretch(1)
+        diagnostics.add_layout(diag_actions)
+        diagnostics.add(footnote(
+            "The log records recognition text and errors only. Microphone audio is never written to disk."
+        ))
+        layout.addWidget(diagnostics)
+
         privacy = Card("Privacy")
         privacy.add(muted(
             "Microphone audio is processed locally by the Vosk model and is never recorded, "
@@ -406,6 +493,15 @@ class MainWindow(QWidget):
         ))
         layout.addWidget(privacy)
         layout.addStretch(1)
+        return self._scroll(page)
+
+    # =====================================================================
+    # custom commands and automations
+    # =====================================================================
+    def _page_commands(self) -> QWidget:
+        page, layout = self._page()
+        self.custom_editor = CustomEditor(self.runtime)
+        layout.addWidget(self.custom_editor)
         return self._scroll(page)
 
     # =====================================================================
@@ -609,7 +705,7 @@ class MainWindow(QWidget):
 
         about = Card("What NOVA is")
         about.add(muted(
-            "A lightweight desktop companion with an animated face, eight-section control center, "
+            "A lightweight desktop companion with an animated face, nine-section control center, "
             "editable study and entertainment modes, fully offline wake-word and command recognition, "
             "Windows SAPI speech, and honest local monitoring for OpenCode and Codex Desktop."
         ))
@@ -668,6 +764,9 @@ class MainWindow(QWidget):
 
         self.speech_switch.toggled.connect(lambda checked: self.runtime.set_muted(not checked))
         self.wake_switch.toggled.connect(self.runtime.set_wake_enabled)
+        self.always_switch.toggled.connect(
+            lambda checked: self._save({"always_listen": bool(checked)})
+        )
         self.opencode_switch.toggled.connect(
             lambda checked: self._save({"opencode_enabled": checked})
         )
@@ -722,6 +821,8 @@ class MainWindow(QWidget):
 
         for editor in getattr(self, "mode_editors", {}).values():
             editor.refresh()
+        if hasattr(self, "custom_editor"):
+            self.custom_editor.refresh()
 
         path = startup.startup_folder()
         self.startup_status.setToolTip(str(path))
@@ -742,6 +843,7 @@ class MainWindow(QWidget):
         s = self.runtime.settings
         self.speech_switch.set_checked_silently(bool(s.get("voice_enabled", True)))
         self.wake_switch.set_checked_silently(bool(s.get("wake_enabled", True)))
+        self.always_switch.set_checked_silently(bool(s.get("always_listen", True)))
         self.face_switch.set_checked_silently(bool(s.get("show_face", True)))
         self.face_quick.setText("Hide face" if self.face.isVisible() else "Show face")
         self.startup_switch.set_checked_silently(startup.is_enabled())
@@ -751,6 +853,8 @@ class MainWindow(QWidget):
         self.sync_controls()
         for editor in getattr(self, "mode_editors", {}).values():
             editor.refresh()
+        if hasattr(self, "custom_editor"):
+            self.custom_editor.refresh()
         self.startup_status.set_text(
             "Enabled · NOVA starts quietly at sign-in" if startup.is_enabled()
             else "Disabled · NOVA only starts when you launch it"
@@ -774,8 +878,24 @@ class MainWindow(QWidget):
         self.voice_status.set_text(self._status.get("voice", "—"))
         self.opencode_status.set_text(self._status.get("opencode", "—"))
         self.codex_status.set_text(self._status.get("codex", "—"))
+        self.diag_wake.set_text(self._status.get("wake", "—"))
         self.last_event.setText(self._status.get("last_event", "NOVA is ready."))
-        header = self._status.get("voice", "")
+
+        heard = str(self._status.get("last_heard", "") or "").strip()
+        command = str(self._status.get("last_command", "") or "").strip()
+        result = str(self._status.get("last_result", "") or "").strip()
+        error = str(self._status.get("mic_error", "") or "").strip()
+        self.last_heard_label.setText(heard or "Nothing recognised yet.")
+        self.last_command_label.setText(command or "No command executed yet.")
+        self.last_result_label.setText(result or "No result yet.")
+        self.diag_heard.setText(heard or "Nothing recognised yet.")
+        self.diag_command.setText(command or "No command executed yet.")
+        self.diag_result.setText(result or "No result yet.")
+        self.diag_error.setText(error or "No microphone or recognition errors.")
+        activity = self._status.get("recent_activity") or []
+        self.activity_label.setText("\n".join(str(item) for item in activity) or "No activity yet.")
+
+        header = self._status.get("wake") or self._status.get("voice", "")
         if self.runtime.muted:
             header = "Voice muted · monitoring active"
         self.header_status.setText(str(header)[:70])
@@ -1019,6 +1139,10 @@ class MainWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "NOVA", f"Could not open {path}: {exc}")
 
+    def _open_log(self) -> None:
+        log_file = LOGS_DIR / "nova.log"
+        self._open_path(log_file if log_file.exists() else LOGS_DIR)
+
     # =====================================================================
     # window behaviour
     # =====================================================================
@@ -1028,6 +1152,13 @@ class MainWindow(QWidget):
             return
         area = screen.availableGeometry()
         self.move(area.center() - self.rect().center())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        grip = getattr(self, "size_grip", None)
+        if grip is not None:
+            grip.move(self.width() - grip.width() - 4, self.height() - grip.height() - 4)
+            grip.raise_()
 
     def eventFilter(self, obj, event) -> bool:
         if obj in self._drag_widgets:

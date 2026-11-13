@@ -91,6 +91,52 @@ def test_voice_and_rate_are_passed_to_the_backend():
         output.stop()
 
 
+def test_say_and_wait_waits_for_real_playback_completion():
+    class SlowBackend(FakeBackend):
+        def say(self, text):
+            self.said.append(text)
+            time.sleep(0.15)
+            return True
+
+    backend = SlowBackend()
+    output = SpeechOutput(enabled=True, backend=backend)
+    try:
+        assert output.say_and_wait("A complete sentence", timeout=3.0) is True
+        assert backend.said == ["A complete sentence"]
+        assert output.is_speaking is False
+    finally:
+        output.stop()
+
+
+def test_wait_until_idle_returns_true_when_nothing_is_speaking():
+    backend = FakeBackend()
+    output = SpeechOutput(enabled=True, backend=backend)
+    try:
+        assert output.is_speaking is False
+        assert output.wait_until_idle(0.5) is True
+    finally:
+        output.stop()
+
+
+def test_wait_until_quiet_includes_queued_but_not_started_speech():
+    class SlowBackend(FakeBackend):
+        def say(self, text):
+            self.said.append(text)
+            time.sleep(0.15)
+            return True
+
+    backend = SlowBackend()
+    output = SpeechOutput(enabled=True, backend=backend)
+    try:
+        output.say("Queued announcement")
+        assert output.is_busy is True
+        assert output.wait_until_quiet(3.0) is True
+        assert backend.said == ["Queued announcement"]
+        assert output.is_busy is False
+    finally:
+        output.stop()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows SAPI only")
 def test_real_windows_sapi_host_lists_installed_voices():
     backend = SapiBackend()

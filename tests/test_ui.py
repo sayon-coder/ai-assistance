@@ -31,6 +31,36 @@ class StubRuntime(QObject):
             "last_event": "NOVA is ready, sir.",
         }
         self.speech = SimpleNamespace(set_rate=lambda rate: self.calls.append(("rate", rate)))
+        self.custom_data = {"version": 1, "commands": [], "automations": []}
+
+    def custom_snapshot(self):
+        import copy
+
+        return copy.deepcopy(self.custom_data)
+
+    def save_custom_command(self, entry, entry_id=None):
+        self.calls.append(("save_command", entry))
+        return entry
+
+    def delete_custom_command(self, entry_id):
+        self.calls.append(("delete_command", entry_id))
+        return True
+
+    def set_custom_command_enabled(self, entry_id, enabled):
+        self.calls.append(("toggle_command", entry_id, enabled))
+        return True
+
+    def save_automation(self, entry, entry_id=None):
+        self.calls.append(("save_automation", entry))
+        return entry
+
+    def delete_automation(self, entry_id):
+        self.calls.append(("delete_automation", entry_id))
+        return True
+
+    def set_automation_enabled(self, entry_id, enabled):
+        self.calls.append(("toggle_automation", entry_id, enabled))
+        return True
 
     def status_snapshot(self):
         return dict(self.status)
@@ -106,17 +136,19 @@ def dispose_widgets(qapp):
     qapp.processEvents()
 
 
-def test_window_has_all_eight_sections(qapp):
+def test_window_has_all_required_sections(qapp):
     runtime, face, window = make_window(qapp)
     try:
         assert [key for key, _ in PAGES] == [
-            "dashboard", "study", "entertainment", "voice",
+            "dashboard", "study", "entertainment", "voice", "commands",
             "appearance", "monitoring", "startup", "about",
         ]
-        assert window.stack.count() == 8
+        assert window.stack.count() == 9
         assert set(window.nav_buttons) == {key for key, _ in PAGES}
         window.show_page("voice")
         assert window.stack.currentWidget() is window.pages["voice"]
+        window.show_page("commands")
+        assert window.stack.currentWidget() is window.pages["commands"]
         window.show_page("about")
         assert window.stack.currentWidget() is window.pages["about"]
     finally:

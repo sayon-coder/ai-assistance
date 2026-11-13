@@ -1,15 +1,21 @@
 """Fully offline wake-word ("NOVA") and command capture using Vosk.
 
-No Picovoice key, no cloud speech service and no audio ever leaves the machine.
-The small English Vosk model (~40 MB, Apache-2.0) is used for both wake-word
-spotting and command recognition. CPU use is modest because recognition runs on
-0.25 s audio blocks and the model is loaded once per process.
+The wake interaction is deliberately silent: say "NOVA", hear one short
+confirmation beep, then speak the command.  Microphone input is gated while
+the beep plays, stale audio is discarded, and recognition pauses whenever
+Windows speech output is actually speaking so NOVA never hears itself.
+
+No Picovoice key, cloud service or extra model is used.  The existing small
+English Vosk model is loaded once per process.
 """
 from __future__ import annotations
 
+import array
 import json
 import logging
+import math
 import queue
+import re
 import threading
 import time
 
@@ -19,7 +25,20 @@ log = logging.getLogger("nova.voice")
 
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000  # 0.25 s at 16 kHz
-WAKE_VARIANTS = ("nova", "no va", "nov a", "novak", "hey nova")
+WAKE_WORD = "nova"
+WAKE_GRAMMAR = '["nova", "[unk]"]'
+WAKE_DEBOUNCE = 1.5          # seconds; one wake can never start two sessions
+BEEP_GATE_SECONDS = 0.45     # microphone is ignored while the beep plays
+SETTLE_SECONDS = 0.30        # discard residual audio after the beep
+COMMAND_START_TIMEOUT = 6.0  # wait this long for speech to begin
+COMMAND_SILENCE = 1.1        # end the command after this much trailing silence
+COMMAND_MAX_SECONDS = 12.0   # hard upper bound for one command
+SPEECH_RMS_THRESHOLD = 300   # lightweight VAD, no extra model
+MIN_SPEECH_BLOCKS = 2
+N_ALTERNATIVES = 5           # Vosk's own hypotheses, exact-matched (never fuzzy)
+DESTRUCTIVE_ALTERNATIVES = 2  # exit/quit may only come from the best two
+_TOKEN = re.compile(r"[a-z']+")
+
 _MODEL_CACHE: dict[str, object] = {}
 
 
@@ -33,13 +52,39 @@ def _load_model(path: str):
     return _MODEL_CACHE[path]
 
 
+def tokens(text: str) -> list[str]:
+    return _TOKEN.findall(str(text or "").lower())
+
+
+def is_wake_phrase(text: str) -> bool:
+    """Exact token match only: "NOVA" (or "hey NOVA"), never "novak"."""
+    return WAKE_WORD in tokens(text)
+
+
+def _rms(pcm: bytes) -> float:
+    """Root-mean-square level of 16-bit mono PCM without a heavy dependency."""
+    if not pcm:
+        return 0.0
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm[:usable])
+    if not samples:
+        return 0.0
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    return math.sqrt(total / len(samples))
+
+
 def _play_beep() -> None:
     try:
         import winsound
 
         winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
     except Exception:
-        pass
+        log.debug("Confirmation beep unavailable", exc_info=True)
 
 
 def list_microphones() -> list[tuple[int | None, str]]:
@@ -80,17 +125,26 @@ def measure_input(seconds: float = 1.2, device: int | None = None) -> dict:
 
 
 class VoiceController:
-    def __init__(self, settings: dict, command_router, status_callback=None, face_callback=None):
+    def __init__(self, settings: dict, command_router, status_callback=None,
+                 face_callback=None, event_callback=None, beep=None):
         self.settings = dict(settings or {})
         self.command_router = command_router
         self.status_callback = status_callback or (lambda text: None)
         self.face_callback = face_callback or (lambda state: None)
+        self.event_callback = event_callback or (lambda kind, text: None)
+        self._beep = beep or _play_beep
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._manual = threading.Event()
+        self._session_lock = threading.Lock()
         self._status = ""
         self._model = None
         self._last_manual_thread: threading.Thread | None = None
+        self._next_wake_at = 0.0
+        self._continuous = False
+        self.always_listen = bool(self.settings.get("always_listen", True))
+        self._recent: list[tuple[str, float]] = []
+        self._last_executed: tuple[str, float] = ("", 0.0)
 
     # -- helpers -----------------------------------------------------------
     def _set_status(self, text: str) -> None:
@@ -101,6 +155,12 @@ class VoiceController:
             self.status_callback(text)
         except Exception:
             log.exception("Voice status callback failed")
+
+    def _emit(self, kind: str, text: str) -> None:
+        try:
+            self.event_callback(str(kind), str(text))
+        except Exception:
+            log.exception("Voice event callback failed")
 
     def _device(self):
         value = self.settings.get("microphone_device")
@@ -114,6 +174,57 @@ class VoiceController:
     def _model_path(self):
         return resolve_model(self.settings.get("vosk_model_path"))
 
+    @property
+    def _speech(self):
+        return getattr(self.command_router, "speech", None)
+
+    def _speech_is_speaking(self) -> bool:
+        speech = self._speech
+        if speech is None:
+            return False
+        busy = getattr(speech, "is_busy", None)
+        if busy is not None:
+            return bool(busy)
+        return bool(getattr(speech, "is_speaking", False))
+
+    def _wait_for_speech_end(self, timeout: float) -> bool:
+        waiter = getattr(self._speech, "wait_until_quiet", None)
+        if not callable(waiter):
+            waiter = getattr(self._speech, "wait_until_idle", None)
+        if not callable(waiter):
+            return True
+        try:
+            return bool(waiter(timeout))
+        except Exception:
+            log.exception("Could not wait for speech output")
+            return False
+
+    @staticmethod
+    def _drain(audio_q: queue.Queue) -> int:
+        dropped = 0
+        while True:
+            try:
+                audio_q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                return dropped
+
+    def _gate_microphone(self, audio_q: queue.Queue, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline and not self._stop.is_set():
+            try:
+                audio_q.get(timeout=min(0.05, max(0.005, deadline - time.monotonic())))
+            except queue.Empty:
+                pass
+        self._drain(audio_q)
+
+    @staticmethod
+    def _reset(recognizer) -> None:
+        try:
+            recognizer.Reset()
+        except Exception:
+            log.debug("Recogniser reset was not available", exc_info=True)
+
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -126,11 +237,17 @@ class VoiceController:
         self._stop.set()
         if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=2.5)
+        if (self._last_manual_thread and self._last_manual_thread.is_alive()
+                and self._last_manual_thread is not threading.current_thread()):
+            self._last_manual_thread.join(timeout=1.5)
         self._thread = None
 
     def request_manual_listen(self) -> None:
         """Capture one command now, even without saying the wake word."""
         if self._thread and self._thread.is_alive():
+            if self.always_listen:
+                self._set_status("Listening continuously")
+                return
             self._manual.set()
             self._set_status("Listening for your command…")
             return
@@ -173,10 +290,18 @@ class VoiceController:
                 try:
                     _q.put_nowait(bytes(indata))
                 except queue.Full:
-                    pass
+                    # Drop the oldest block so the queue stays bounded.
+                    try:
+                        _q.get_nowait()
+                        _q.put_nowait(bytes(indata))
+                    except queue.Empty:
+                        pass
 
             try:
-                recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, '["nova", "[unk]"]')
+                if self.always_listen:
+                    recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
+                else:
+                    recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, WAKE_GRAMMAR)
                 with sd.RawInputStream(
                     samplerate=SAMPLE_RATE,
                     blocksize=BLOCK_SIZE,
@@ -185,112 +310,315 @@ class VoiceController:
                     callback=callback,
                     device=device,
                 ):
-                    self._set_status("Listening for NOVA")
-                    log.info("Wake-word listener started on device %s", device if device is not None else "default")
-                    self._wake_loop(audio_q, recognizer)
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    if self.always_listen:
+                        self._set_status("Listening continuously")
+                        log.info("Continuous listener started on device %s",
+                                 device if device is not None else "default")
+                    else:
+                        self._set_status("Listening for NOVA")
+                        log.info("Wake-word listener started on device %s",
+                                 device if device is not None else "default")
+                    self._emit("mic_error", "")
+                    if self.always_listen:
+                        self._listen_loop(audio_q, recognizer)
+                    else:
+                        self._wake_loop(audio_q, recognizer)
             except Exception as exc:
                 if self._stop.is_set():
                     break
                 log.warning("Microphone stream failed: %s", exc)
                 self._set_status("Microphone unavailable · retrying")
+                self._emit("mic_error", str(exc))
                 self.face_callback("idle")
                 self._stop.wait(2.5)
                 if device is not None:
                     # Configured device may have been unplugged; fall back once.
                     device = None
 
-        self._set_status("Wake word off")
+        self._continuous = False
+        self._set_status("Listening stopped")
         self.face_callback("idle")
+
+    def _listen_loop(self, audio_q: queue.Queue, recognizer) -> None:
+        """Always-on command recognition: no wake word and no beep.
+
+        Only exact, known command phrases are executed.  Anything else is
+        ignored silently, so background noise can never trigger the old
+        "Sorry, I didn't catch that" loop.
+        """
+        self._continuous = True
+        self._recent.clear()
+        try:
+            while not self._stop.is_set():
+                # Never listen while NOVA is speaking, otherwise it hears itself.
+                if self._speech_is_speaking():
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    self._stop.wait(0.05)
+                    continue
+
+                try:
+                    pcm = audio_q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+
+                if self._speech_is_speaking():
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    continue
+
+                try:
+                    if not recognizer.AcceptWaveform(pcm):
+                        continue
+                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                except Exception:
+                    log.exception("Continuous recognizer failed")
+                    return
+                if not text:
+                    continue
+                if self._dispatch_transcript(text, audio_q, recognizer) not in (
+                    None, "none", "unknown",
+                ):
+                    # A command ran: drop any audio from its spoken reply.
+                    self._wait_for_speech_end(20.0)
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    self.face_callback("idle")
+                    self._set_status("Listening continuously")
+        finally:
+            self._continuous = False
+
+    def _dispatch_transcript(self, text: str, audio_q: queue.Queue, recognizer) -> str | None:
+        """Match a final transcript, joining short fragments if needed.
+
+        Vosk sometimes ends a phrase early, so "study" and "mode" can arrive as
+        two finals.  The last few fragments are tried longest-first, which makes
+        multi-word commands reliable without any fuzzy matching.
+        """
+        now = time.monotonic()
+        self._recent = [(part, stamp) for part, stamp in self._recent if now - stamp <= 2.5]
+        self._recent.append((text, now))
+        if len(self._recent) > 5:
+            del self._recent[:-5]
+
+        candidates: list[str] = []
+        for count in (5, 4, 3, 2, 1):
+            if len(self._recent) >= count:
+                candidate = " ".join(part for part, _ in self._recent[-count:]).strip()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+        for candidate in candidates:
+            if (candidate == self._last_executed[0]
+                    and now - self._last_executed[1] < 2.0):
+                continue
+            action = self._execute_phrase(candidate)
+            if action not in (None, "none", "unknown"):
+                self._recent.clear()
+                self._last_executed = (candidate, now)
+                return action
+        return None
+
+    def _execute_phrase(self, phrase: str) -> str:
+        try:
+            action = self.command_router.handle(phrase, announce_unknown=False)
+        except TypeError:
+            action = self.command_router.handle(phrase)
+        except Exception:
+            log.exception("Command handling failed")
+            return "unknown"
+        if action in (None, "none", "unknown"):
+            log.info("Ignored unrecognized speech: %s", phrase)
+            return "unknown"
+        self._emit("last_heard", phrase)
+        self._emit("last_command", phrase)
+        if not str(action).startswith(("custom", "automation")):
+            self._emit("last_result", f"Executed: {action}")
+        self.face_callback("listening")
+        return str(action)
 
     def _wake_loop(self, audio_q: queue.Queue, recognizer) -> None:
-        while not self._stop.is_set():
-            if self._manual.is_set():
-                self._manual.clear()
-                self._acknowledge_and_capture(audio_q)
+        self._continuous = True
+        try:
+            while not self._stop.is_set():
+                # While NOVA itself is speaking, discard microphone audio so its
+                # own voice can never be recognised as a wake word or command.
+                if self._speech_is_speaking():
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    self._stop.wait(0.05)
+                    continue
+
+                if self._manual.is_set():
+                    self._manual.clear()
+                    self._run_command_session(audio_q)
+                    self._reset(recognizer)
+                    self._drain(audio_q)
+                    continue
+
                 try:
-                    recognizer.Reset()
+                    pcm = audio_q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+
+                if self._speech_is_speaking():
+                    self._drain(audio_q)
+                    self._reset(recognizer)
+                    continue
+
+                try:
+                    if recognizer.AcceptWaveform(pcm):
+                        text = json.loads(recognizer.Result()).get("text", "")
+                    else:
+                        text = json.loads(recognizer.PartialResult()).get("partial", "")
                 except Exception:
-                    log.debug("Wake recognizer could not be reset")
-            try:
-                pcm = audio_q.get(timeout=0.3)
-            except queue.Empty:
-                continue
-            try:
-                if recognizer.AcceptWaveform(pcm):
-                    text = json.loads(recognizer.Result()).get("text", "")
-                else:
-                    text = json.loads(recognizer.PartialResult()).get("partial", "")
-            except Exception:
-                log.exception("Wake recognizer failed")
+                    log.exception("Wake recognizer failed")
+                    return
+
+                now = time.monotonic()
+                if now < self._next_wake_at:
+                    continue
+                if is_wake_phrase(text):
+                    self._next_wake_at = now + WAKE_DEBOUNCE
+                    log.info("Wake word detected: %s", text)
+                    self._run_command_session(audio_q)
+                    self._reset(recognizer)
+                    self._drain(audio_q)
+        finally:
+            self._continuous = False
+
+    # -- one command session ----------------------------------------------
+    def _run_command_session(self, audio_q: queue.Queue, recognizer=None) -> None:
+        if not self._session_lock.acquire(blocking=False):
+            return
+        try:
+            self.face_callback("listening")
+            self._set_status("Listening for your command…")
+            # Never start capturing while an announcement is still playing.
+            self._wait_for_speech_end(10.0)
+            if self._stop.is_set():
                 return
-            if self._is_wake(text):
-                log.info("Wake word detected: %s", text)
-                self._acknowledge_and_capture(audio_q)
-                try:
-                    recognizer.Reset()
-                except Exception:
-                    pass
+            self._beep_and_settle(audio_q)
+            if self._stop.is_set():
+                return
 
-    @staticmethod
-    def _is_wake(text: str) -> bool:
-        normalized = " ".join(str(text or "").lower().split())
-        return any(variant in normalized for variant in WAKE_VARIANTS)
+            if recognizer is None:
+                from vosk import KaldiRecognizer
 
-    def _acknowledge_and_capture(self, audio_q: queue.Queue) -> None:
-        from vosk import KaldiRecognizer
+                recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
 
-        self.face_callback("listening")
-        self._set_status("Listening for your command…")
-        _play_beep()
-        speech = getattr(self.command_router, "speech", None)
-        if speech is not None and getattr(speech, "enabled", False):
-            speech.say("Yes, sir?")
-            time.sleep(0.55)
-        phrase = self._capture(audio_q, KaldiRecognizer(self._model, SAMPLE_RATE))
-        if phrase and not self._stop.is_set():
+            phrase, heard_speech, aborted = self._capture(audio_q, recognizer)
+            if self._stop.is_set() or aborted:
+                return
+            if not heard_speech:
+                # CASE A: no actual speech. Stay completely silent.
+                self._emit("last_result", "No speech detected")
+                return
+            if not phrase:
+                # CASE B: speech but nothing intelligible.
+                self._handle_unintelligible(audio_q)
+                return
+
+            # CASE C: a transcript exists; the deterministic router decides.
+            self._emit("last_heard", phrase)
             self._set_status(f"Heard: {phrase}")
             try:
-                self.command_router.handle(phrase)
+                action = self.command_router.handle(phrase, announce_unknown=False)
+            except TypeError:
+                # Older routers without the keyword argument.
+                action = self.command_router.handle(phrase)
             except Exception:
                 log.exception("Command handling failed")
-        else:
-            self._set_status("Listening for NOVA")
-        self.face_callback("idle")
+                action = "unknown"
 
-    def _capture(self, audio_q: queue.Queue, recognizer, timeout: float = 8.0) -> str:
+            if action in (None, "none", "unknown"):
+                self._handle_unintelligible(audio_q)
+            else:
+                self._emit("last_command", phrase)
+                # Custom commands and automations report their own real result.
+                if not str(action).startswith(("custom", "automation")):
+                    self._emit("last_result", f"Executed: {action}")
+            # Wait for any spoken confirmation before reopening the microphone.
+            self._wait_for_speech_end(20.0)
+            self._drain(audio_q)
+        finally:
+            self.face_callback("idle")
+            self._set_status("Listening for NOVA" if self._continuous else "Listening stopped")
+            self._session_lock.release()
+
+    def _beep_and_settle(self, audio_q: queue.Queue) -> None:
+        self._drain(audio_q)
+        try:
+            self._beep()
+        except Exception:
+            log.debug("Could not play the confirmation beep", exc_info=True)
+        self._gate_microphone(audio_q, BEEP_GATE_SECONDS)
+        self._gate_microphone(audio_q, SETTLE_SECONDS)
+        self._drain(audio_q)
+
+    def _handle_unintelligible(self, audio_q: queue.Queue) -> None:
+        """Ignore speech that did not match a command; never nag the user."""
+        self._set_status("Speech detected · no matching command")
+        self._emit("last_result", "No matching command")
+        self._drain(audio_q)
+
+    def _capture(self, audio_q: queue.Queue, recognizer) -> tuple[str, bool, bool]:
+        """Return (text, heard_speech, aborted).
+
+        Silence is detected with a small RMS threshold, so a command is not cut
+        off and background noise does not create endless listening sessions.
+        """
         started = time.monotonic()
-        heard_voice = False
         last_voice = started
-        while time.monotonic() - started < timeout and not self._stop.is_set():
+        speech_blocks = 0
+        heard_speech = False
+
+        while time.monotonic() - started < COMMAND_MAX_SECONDS:
+            if self._stop.is_set():
+                return "", heard_speech, True
+            if self._speech_is_speaking():
+                self._drain(audio_q)
+                return "", heard_speech, True
             try:
-                data = audio_q.get(timeout=0.3)
+                data = audio_q.get(timeout=0.2)
             except queue.Empty:
+                if not heard_speech and time.monotonic() - started > COMMAND_START_TIMEOUT:
+                    return "", False, False
+                if heard_speech and time.monotonic() - last_voice > COMMAND_SILENCE:
+                    break
                 continue
+
+            if _rms(data) >= SPEECH_RMS_THRESHOLD:
+                speech_blocks += 1
+                if speech_blocks >= MIN_SPEECH_BLOCKS:
+                    heard_speech = True
+                last_voice = time.monotonic()
+
             try:
                 if recognizer.AcceptWaveform(data):
                     text = json.loads(recognizer.Result()).get("text", "").strip()
                     if text:
                         log.info("Voice command recognized: %s", text)
-                        return text
-                else:
-                    partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
-                    if partial:
-                        heard_voice = True
-                        last_voice = time.monotonic()
+                        return text, True, False
             except Exception:
                 log.exception("Command recognition failed")
-                return ""
-            if heard_voice and time.monotonic() - last_voice > 1.6:
+                return "", heard_speech, False
+
+            if heard_speech and time.monotonic() - last_voice > COMMAND_SILENCE:
                 break
+
         try:
-            return json.loads(recognizer.FinalResult()).get("text", "").strip()
+            text = json.loads(recognizer.FinalResult()).get("text", "").strip()
         except Exception:
-            return ""
+            text = ""
+        if text:
+            heard_speech = True
+        return text, heard_speech, False
 
+    # -- manual listening when the wake loop is not running ----------------
     def _manual_session(self) -> None:
-        """One-off listening when the continuous wake loop is not running."""
-        from vosk import KaldiRecognizer
-
         path = self._model_path()
         if not model_is_ready(path):
             self._set_status("Speech model missing · download it in Voice settings")
@@ -313,28 +641,21 @@ class VoiceController:
             try:
                 audio_q.put_nowait(bytes(indata))
             except queue.Full:
-                pass
+                try:
+                    audio_q.get_nowait()
+                    audio_q.put_nowait(bytes(indata))
+                except queue.Empty:
+                    pass
 
-        self._set_status("Listening for your command…")
-        self.face_callback("listening")
         try:
             with sd.RawInputStream(
                 samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE, dtype="int16",
                 channels=1, callback=callback, device=self._device(),
             ):
-                _play_beep()
-                time.sleep(0.35)
-                phrase = self._capture(audio_q, KaldiRecognizer(self._model, SAMPLE_RATE))
+                self._drain(audio_q)
+                self._run_command_session(audio_q)
         except Exception as exc:
             log.warning("Manual listen failed: %s", exc)
             self._set_status(f"Microphone unavailable · {exc}")
+            self._emit("mic_error", str(exc))
             self.face_callback("idle")
-            return
-        if phrase:
-            self._set_status(f"Heard: {phrase}")
-            try:
-                self.command_router.handle(phrase)
-            except Exception:
-                log.exception("Command handling failed")
-        self.face_callback("idle")
-        self._set_status("Wake word off")

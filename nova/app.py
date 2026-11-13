@@ -16,6 +16,7 @@ from .face_render import render_face_image
 from .face_widget import FaceWidget
 from .logging_setup import setup_logging
 from .runtime import NovaRuntime
+from .ui import theme
 from .ui.main_window import MainWindow
 from .ui.wizard import SetupWizard
 
@@ -72,10 +73,10 @@ class NovaApplication(QObject):
         self.tray.setToolTip("NOVA · local desktop assistant")
         self.tray_menu = QMenu()
         self.tray_menu.setStyleSheet("""
-            QMenu { background: #0F1621; color: #E9EFFA; border: 1px solid #27374C; padding: 6px; }
+            QMenu { background: #181818; color: #FFFFFF; border: 1px solid #333333; padding: 6px; }
             QMenu::item { padding: 7px 24px 7px 16px; border-radius: 5px; }
-            QMenu::item:selected { background: #1B2C42; }
-            QMenu::separator { height: 1px; background: #1F2C3F; margin: 5px 8px; }
+            QMenu::item:selected { background: #1E3A5F; }
+            QMenu::separator { height: 1px; background: #292929; margin: 5px 8px; }
         """)
 
         self.open_action = QAction("Open NOVA Control Center", self)
@@ -322,6 +323,7 @@ def main() -> None:
     qt.setApplicationDisplayName("NOVA")
     qt.setOrganizationName("NOVA Local Assistant")
     qt.setStyle("Fusion")
+    qt.setStyleSheet(theme.STYLESHEET)
     qt.setQuitOnLastWindowClosed(False)
     qt.setWindowIcon(_app_icon())
 

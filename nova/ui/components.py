@@ -80,7 +80,7 @@ class Switch(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        off = QColor(38, 54, 75)
+        off = QColor(51, 51, 51)
         on = QColor(theme.ACCENT)
         track = QColor(
             int(off.red() + (on.red() - off.red()) * self._pos),
@@ -166,7 +166,7 @@ class Divider(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(1)
-        self.setStyleSheet("background: #1E2B3D; border: none;")
+        self.setStyleSheet(f"background: {theme.BORDER}; border: none;")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
 

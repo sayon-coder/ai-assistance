@@ -16,7 +16,7 @@ from pathlib import Path
 
 log = logging.getLogger("nova.config")
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 APP_NAME = "NOVA"
 
 
@@ -51,6 +51,7 @@ MODELS_DIR = _DATA_ROOT / "models"
 ASSETS_DIR = ROOT / "assets"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 MODES_PATH = CONFIG_DIR / "modes.json"
+CUSTOM_COMMANDS_PATH = CONFIG_DIR / "custom_commands.json"
 
 for _folder in (CONFIG_DIR, LOGS_DIR, MODELS_DIR):
     try:
@@ -64,6 +65,7 @@ DEFAULT_SETTINGS: dict = {
     "assistant_name": "NOVA",
     # Voice input
     "wake_enabled": True,
+    "always_listen": True,
     "vosk_model_path": "models/vosk-model-small-en-us-0.15",
     "microphone_device": None,
     # Voice output

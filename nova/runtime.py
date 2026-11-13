@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject
@@ -14,6 +15,7 @@ from .config import (
     ROOT, load_modes, load_settings, save_modes as persist_modes,
     save_settings as persist_settings,
 )
+from .custom import ActionExecutor, AutomationRunner, CustomStore
 from .model_setup import download as download_model, model_is_ready, resolve_model
 from .modes import ModeManager
 from .monitors.codex import CodexMonitor
@@ -39,6 +41,12 @@ class NovaRuntime(QObject):
         )
         self.modes = ModeManager(self.modes_data, self.speech, self._notify)
         self.commands = CommandRouter(self.modes, self.speech, self)
+        self.custom = CustomStore(reserved_phrases=self.commands.reserved_phrases())
+        self.executor = ActionExecutor(self, notify=self._notify)
+        self.automations = AutomationRunner(
+            self.executor, notify=self._notify, status=self._automation_status
+        )
+        self.commands.custom_handler = self.handle_custom_phrase
 
         self.voice: VoiceController | None = None
         self.opencode: OpenCodeMonitor | None = None
@@ -49,16 +57,46 @@ class NovaRuntime(QObject):
         self._face_state = "idle"
 
         self.status = {
+            "running": "NOVA is running",
             "voice": "Starting voice services…",
+            "wake": "Starting…",
+            "microphone": self._microphone_label(),
             "speech": "Muted" if self.muted else "Windows speech ready",
             "opencode": "OpenCode starting…",
             "codex": "Codex starting…",
+            "active_mode": "normal",
+            "last_heard": "",
+            "last_command": "",
+            "last_result": "No command yet.",
+            "mic_error": "",
+            "recent_activity": [],
             "last_event": "NOVA is ready, sir.",
         }
 
     # -- state helpers -----------------------------------------------------
     def status_snapshot(self) -> dict:
         return dict(self.status)
+
+    def _microphone_label(self) -> str:
+        selected = self.settings.get("microphone_device")
+        if selected in (None, ""):
+            return "System default microphone"
+        try:
+            for index, name in list_microphones():
+                if index == selected:
+                    return str(name)
+        except Exception:
+            log.debug("Could not read the selected microphone name", exc_info=True)
+        return f"Microphone device {selected}"
+
+    def _record_activity(self, text: str) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+        activity = list(self.status.get("recent_activity", []))
+        activity.insert(0, f"{time.strftime('%H:%M')} · {text}")
+        del activity[8:]
+        self._set_status("recent_activity", activity)
 
     def _set_status(self, key: str, value: str) -> None:
         if self.status.get(key) == value:
@@ -85,10 +123,13 @@ class NovaRuntime(QObject):
     def _on_speech_state(self, speaking: bool) -> None:
         self.bridge.speech_state.emit(bool(speaking))
         if speaking:
+            self._set_status("speech", "Speaking…")
             if self._face_state in {"idle", "speaking"}:
                 self._set_face("speaking")
-        elif self._face_state == "speaking":
-            self._set_face("idle")
+        else:
+            self._set_status("speech", "Muted" if self.muted else "Windows speech ready")
+            if self._face_state == "speaking":
+                self._set_face("idle")
 
     def _on_speech_error(self, message: str) -> None:
         self._set_status("speech", message)
@@ -130,20 +171,47 @@ class NovaRuntime(QObject):
             self.voice.stop()
             self.voice = None
         if not self.settings.get("wake_enabled", True):
-            self._set_status("voice", "Wake word off")
+            self._set_status("voice", "Listening stopped")
+            self._set_status("wake", "Listening stopped")
             return
         model = resolve_model(self.settings.get("vosk_model_path"))
         if not model_is_ready(model):
             self._set_status("voice", "Speech model missing · download it in Voice settings")
+            self._set_status("wake", "Speech model missing")
             log.info("Wake word not started: Vosk model missing at %s", model)
             return
         self.voice = VoiceController(
-            self.settings, self.commands, self._voice_status, self._set_face
+            self.settings, self.commands, self._voice_status, self._set_face,
+            event_callback=self._voice_event,
         )
         self.voice.start()
 
     def _voice_status(self, text: str) -> None:
         self._set_status("voice", text)
+        lowered = str(text).lower()
+        if "listening continuously" in lowered:
+            self._set_status("wake", "Listening continuously")
+        elif "listening for nova" in lowered:
+            self._set_status("wake", "Listening for NOVA")
+        elif "listening for your command" in lowered or "capturing" in lowered:
+            self._set_status("wake", "Capturing a command")
+        elif "listening stopped" in lowered:
+            self._set_status("wake", "Listening stopped")
+        elif "microphone unavailable" in lowered:
+            self._set_status("wake", "Microphone unavailable")
+        elif "speech model missing" in lowered:
+            self._set_status("wake", "Speech model missing")
+
+    def _voice_event(self, kind: str, text: str) -> None:
+        if kind == "last_heard":
+            self._set_status("last_heard", text)
+        elif kind == "last_command":
+            self._set_status("last_command", text)
+        elif kind == "last_result":
+            self._set_status("last_result", text)
+            self._record_activity(text)
+        elif kind == "mic_error":
+            self._set_status("mic_error", text)
 
     def _start_opencode(self) -> None:
         if self.opencode is not None:
@@ -201,7 +269,9 @@ class NovaRuntime(QObject):
         ok = self.modes.activate(name)
         self._set_face("completed" if ok else "error")
         if ok:
+            self._set_status("active_mode", name)
             self._set_status("last_event", f"{name.title()} mode activated.")
+            self._record_activity(f"{name.title()} mode activated")
         return ok
 
     def show_settings(self) -> None:
@@ -257,15 +327,31 @@ class NovaRuntime(QObject):
             return
         if self.voice is None:
             self.voice = VoiceController(
-                self.settings, self.commands, self._voice_status, self._set_face
+                self.settings, self.commands, self._voice_status, self._set_face,
+                event_callback=self._voice_event,
             )
-            self.voice.start()
+            # When the wake word is disabled, capture exactly one command and
+            # then release the microphone again instead of starting the wake loop.
+            if self.settings.get("wake_enabled", True):
+                self.voice.start()
         self.voice.request_manual_listen()
 
     def test_voice(self) -> None:
-        if self.muted:
-            self.set_muted(False)
-        self.speech.say("This is how I sound, sir. All speech is generated locally by Windows.")
+        """Speak a sample locally without permanently changing the mute setting."""
+        def run() -> None:
+            was_muted = self.muted
+            if was_muted:
+                self.speech.set_enabled(True)
+            try:
+                self.speech.say_and_wait(
+                    "This is how I sound, sir. All speech is generated locally by Windows.",
+                    timeout=25.0,
+                )
+            finally:
+                if was_muted:
+                    self.speech.set_enabled(False)
+
+        threading.Thread(target=run, name="NOVA-Voice-Test", daemon=True).start()
 
     def microphones(self) -> list[tuple[int | None, str]]:
         return list_microphones()
@@ -317,9 +403,11 @@ class NovaRuntime(QObject):
         self.speech.set_rate(int(normalized.get("speech_rate", 0)))
         self.speech.set_volume(int(normalized.get("speech_volume", 90)))
 
-        voice_keys = {"vosk_model_path", "microphone_device", "wake_enabled"}
+        voice_keys = {"vosk_model_path", "microphone_device", "wake_enabled", "always_listen"}
         if any(old.get(key) != normalized.get(key) for key in voice_keys):
             self._start_voice()
+        if old.get("microphone_device") != normalized.get("microphone_device"):
+            self._set_status("microphone", self._microphone_label())
         if any(old.get(key) != normalized.get(key) for key in {"opencode_enabled", "opencode_base_url"}):
             self._start_opencode()
         if old.get("codex_enabled") != normalized.get("codex_enabled"):
@@ -350,6 +438,74 @@ class NovaRuntime(QObject):
         self.modes.reload(cleaned)
         self.bridge.settings_changed.emit(dict(self.settings))
         return cleaned
+
+    # -- custom commands and automations ----------------------------------
+    def handle_custom_phrase(self, text: str) -> str | None:
+        entry = self.custom.match(text)
+        if not entry:
+            return None
+        name = str(entry.get("name", "Custom command"))
+        self._set_status("last_command", text)
+        if entry.get("kind") == "automation":
+            started = self.automations.run(entry)
+            if not started:
+                message = f"{name} is already running."
+                self._set_status("last_result", message)
+                self._record_activity(message)
+                return "automation_busy"
+            self._set_status("last_result", f"Automation started: {name}")
+            self._record_activity(f"Automation started: {name}")
+            return f"automation:{entry.get('id')}"
+        try:
+            ok, message = self.executor.execute(entry)
+        except Exception as exc:
+            log.exception("Custom command failed")
+            ok, message = False, str(exc)
+        self._set_status("last_result", message)
+        self._record_activity(message)
+        if not ok:
+            self._notify(name, message)
+        return f"custom:{entry.get('id')}" if ok else "custom_failed"
+
+    def _automation_status(self, text: str) -> None:
+        self._set_status("last_result", text)
+        self._record_activity(text)
+
+    def custom_snapshot(self) -> dict:
+        return self.custom.snapshot()
+
+    def reserved_command_phrases(self) -> set[str]:
+        return self.commands.reserved_phrases()
+
+    def save_custom_command(self, entry: dict, entry_id: str | None = None) -> dict:
+        saved = self.custom.save_command(entry, entry_id)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return saved
+
+    def delete_custom_command(self, entry_id: str) -> bool:
+        removed = self.custom.delete("commands", entry_id)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return removed
+
+    def set_custom_command_enabled(self, entry_id: str, enabled: bool) -> bool:
+        changed = self.custom.set_enabled("commands", entry_id, enabled)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return changed
+
+    def save_automation(self, entry: dict, entry_id: str | None = None) -> dict:
+        saved = self.custom.save_automation(entry, entry_id)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return saved
+
+    def delete_automation(self, entry_id: str) -> bool:
+        removed = self.custom.delete("automations", entry_id)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return removed
+
+    def set_automation_enabled(self, entry_id: str, enabled: bool) -> bool:
+        changed = self.custom.set_enabled("automations", entry_id, enabled)
+        self.bridge.settings_changed.emit(dict(self.settings))
+        return changed
 
     # -- shutdown ----------------------------------------------------------
     def shutdown(self) -> None:

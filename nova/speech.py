@@ -274,6 +274,10 @@ class SpeechOutput:
         self._queue: queue.Queue = queue.Queue(maxsize=16)
         self._stop = threading.Event()
         self._speaking = False
+        self._idle = threading.Event()
+        self._idle.set()
+        self._pending = 0
+        self._pending_lock = threading.Lock()
         self._error_reported = False
         self._thread = threading.Thread(target=self._worker, name="NOVA-TTS", daemon=True)
         self._thread.start()
@@ -289,10 +293,39 @@ class SpeechOutput:
         if self._speaking == value:
             return
         self._speaking = value
+        if value:
+            self._idle.clear()
+        else:
+            self._idle.set()
         try:
             self._on_speaking(value)
         except Exception:
             log.exception("Speaking callback failed")
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking
+
+    @property
+    def is_busy(self) -> bool:
+        with self._pending_lock:
+            return self._speaking or self._pending > 0
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Block until the currently playing utterance has finished."""
+        return self._idle.wait(timeout)
+
+    def wait_until_quiet(self, timeout: float | None = None) -> bool:
+        """Wait for queued speech to start and finish, not just current playback."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._pending_lock:
+                busy = self._speaking or self._pending > 0
+            if not busy:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     # -- public API --------------------------------------------------------
     def start(self) -> None:
@@ -326,16 +359,39 @@ class SpeechOutput:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
+        with self._pending_lock:
+            self._pending = 0
 
     def say(self, text: str) -> None:
         if not self.enabled or not text:
             return
         if len(str(text)) > 700:
             text = str(text)[:700]
+        # Count the item before it becomes visible to the worker.  If the count
+        # were incremented after the put, a very fast utterance could finish
+        # first and leave the busy counter stuck above zero forever.
+        with self._pending_lock:
+            self._pending += 1
         try:
             self._queue.put_nowait(str(text))
         except queue.Full:
+            with self._pending_lock:
+                self._pending = max(0, self._pending - 1)
             log.warning("Speech queue full; dropping announcement")
+
+    def say_and_wait(self, text: str, timeout: float = 30.0) -> bool:
+        """Queue an announcement and block until playback has really finished."""
+        if not self.enabled or not text:
+            return True
+        self.say(text)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._pending_lock:
+                pending = self._pending
+            if pending <= 0 and not self._speaking:
+                return True
+            time.sleep(0.02)
+        return False
 
     def set_voice(self, name: str) -> None:
         self.backend.set_voice(name)
@@ -362,13 +418,15 @@ class SpeechOutput:
                 continue
             if item is None:
                 break
-            if not self.enabled:
-                continue
             try:
+                if not self.enabled:
+                    continue
                 self._set_speaking(True)
                 self.backend.say(item)
             except Exception:
                 log.exception("Speech output failed")
             finally:
+                with self._pending_lock:
+                    self._pending = max(0, self._pending - 1)
                 if self._queue.empty():
                     self._set_speaking(False)

@@ -1,18 +1,16 @@
 {
-  "study": {
-    "greeting": "Welcome back, sir. Your study environment is ready.",
+  "entertainment": {
+    "greeting": "Sure sir. Your entertainment environment is ready.",
     "urls": [
-      "https://www.google.com",
-      "https://chatgpt.com"
+      "https://www.youtube.com"
     ],
     "apps": []
   },
-  "entertainment": {
-    "greeting": "Certainly, sir. Your entertainment environment is ready.",
+  "study": {
+    "greeting": "Sure sir, Your study environment is ready.",
     "urls": [
-      "https://music.youtube.com",
-      "https://open.spotify.com",
-      "https://www.youtube.com"
+      "https://youtube.com",
+      "https://indiabix.com"
     ],
     "apps": []
   }
