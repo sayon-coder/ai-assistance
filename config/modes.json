@@ -1,0 +1,19 @@
+{
+  "study": {
+    "greeting": "Welcome back, sir. Your study environment is ready.",
+    "urls": [
+      "https://www.google.com",
+      "https://chatgpt.com"
+    ],
+    "apps": []
+  },
+  "entertainment": {
+    "greeting": "Certainly, sir. Your entertainment environment is ready.",
+    "urls": [
+      "https://music.youtube.com",
+      "https://open.spotify.com",
+      "https://www.youtube.com"
+    ],
+    "apps": []
+  }
+}

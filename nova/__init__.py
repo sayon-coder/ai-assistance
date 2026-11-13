@@ -1,0 +1,1 @@
+"""NOVA Windows desktop assistant."""
