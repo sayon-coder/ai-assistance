@@ -71,6 +71,21 @@ def test_control_center_is_opaque_and_resizable(qapp):
         face.close()
 
 
+def test_always_listen_switch_reflects_the_runtime(qapp):
+    runtime, face, window = make_window(qapp)
+    try:
+        runtime.settings["always_listen"] = False
+        window.load_from_runtime()
+        assert window.always_switch.isChecked() is False
+
+        runtime.settings["always_listen"] = True
+        window.load_from_runtime()
+        assert window.always_switch.isChecked() is True
+    finally:
+        window.close()
+        face.close()
+
+
 def test_setup_wizard_is_opaque(qapp):
     runtime = StubRuntime()
     wizard = SetupWizard(runtime)

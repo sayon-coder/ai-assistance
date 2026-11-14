@@ -19,7 +19,9 @@ import re
 import threading
 import time
 
+from .commands import build_recognition_grammar, is_command_like, normalize_phrase
 from .model_setup import model_is_ready, resolve_model
+from .phrase import PHRASE_TIMEOUT, PhraseAssembler
 
 log = logging.getLogger("nova.voice")
 
@@ -35,8 +37,13 @@ COMMAND_SILENCE = 1.1        # end the command after this much trailing silence
 COMMAND_MAX_SECONDS = 12.0   # hard upper bound for one command
 SPEECH_RMS_THRESHOLD = 300   # lightweight VAD, no extra model
 MIN_SPEECH_BLOCKS = 2
+MIN_FINAL_BLOCKS = 1         # voiced blocks required before a final can run
 N_ALTERNATIVES = 5           # Vosk's own hypotheses, exact-matched (never fuzzy)
 DESTRUCTIVE_ALTERNATIVES = 2  # exit/quit may only come from the best two
+COMMAND_DEBOUNCE = 2.0       # the same command cannot run twice this quickly
+REPEAT_COOLDOWN = 15.0       # never nag more than once per this window
+REPEAT_MESSAGE = "Sorry, I didn't catch that command. Please repeat."
+DESTRUCTIVE_ACTIONS = {"exit"}
 _TOKEN = re.compile(r"[a-z']+")
 
 _MODEL_CACHE: dict[str, object] = {}
@@ -59,6 +66,27 @@ def tokens(text: str) -> list[str]:
 def is_wake_phrase(text: str) -> bool:
     """Exact token match only: "NOVA" (or "hey NOVA"), never "novak"."""
     return WAKE_WORD in tokens(text)
+
+
+def _has_unknown(text: str) -> bool:
+    return "[unk]" in str(text or "").lower()
+
+
+def _result_texts(payload) -> list[str]:
+    """Return the primary text and Vosk's own alternatives, best first."""
+    if not isinstance(payload, dict):
+        return []
+    texts: list[str] = []
+    primary = str(payload.get("text", "") or "").strip()
+    if primary:
+        texts.append(primary)
+    for alternative in payload.get("alternatives", []) or []:
+        if not isinstance(alternative, dict):
+            continue
+        text = str(alternative.get("text", "") or "").strip()
+        if text and text not in texts:
+            texts.append(text)
+    return texts
 
 
 def _rms(pcm: bytes) -> float:
@@ -126,7 +154,8 @@ def measure_input(seconds: float = 1.2, device: int | None = None) -> dict:
 
 class VoiceController:
     def __init__(self, settings: dict, command_router, status_callback=None,
-                 face_callback=None, event_callback=None, beep=None):
+                 face_callback=None, event_callback=None, beep=None,
+                 grammar_provider=None, phrase_timeout=None):
         self.settings = dict(settings or {})
         self.command_router = command_router
         self.status_callback = status_callback or (lambda text: None)
@@ -143,8 +172,113 @@ class VoiceController:
         self._next_wake_at = 0.0
         self._continuous = False
         self.always_listen = bool(self.settings.get("always_listen", True))
-        self._recent: list[tuple[str, float]] = []
         self._last_executed: tuple[str, float] = ("", 0.0)
+        self._last_repeat_at = 0.0
+
+        # -- dynamic grammar -------------------------------------------------
+        self._grammar_provider = grammar_provider
+        self._grammar_lock = threading.Lock()
+        self._grammar_json = ""
+        self._grammar_phrases: set[str] = set()
+        self._grammar_dirty = threading.Event()
+        timeout = phrase_timeout
+        if timeout is None:
+            try:
+                timeout = float(self.settings.get("phrase_timeout", PHRASE_TIMEOUT))
+            except (TypeError, ValueError):
+                timeout = PHRASE_TIMEOUT
+        timeout = max(2.0, min(8.0, float(timeout)))
+        self._assembler = PhraseAssembler(
+            vocabulary=self._vocabulary, timeout=timeout
+        )
+        self.refresh_grammar()
+
+    # -- vocabulary and grammar -------------------------------------------
+    def _vocabulary(self) -> set[str] | None:
+        with self._grammar_lock:
+            if self._grammar_phrases:
+                return set(self._grammar_phrases)
+        registry = getattr(self.command_router, "registry", None)
+        if registry is None:
+            # Lightweight routers (for example in tests) have no registry; let
+            # the assembler fall back to trying every exact candidate.
+            return None
+        try:
+            return set(registry.phrases())
+        except Exception:
+            log.debug("Could not read registry phrases", exc_info=True)
+            return None
+
+    def _grammar_source(self) -> set[str]:
+        if self._grammar_provider is not None:
+            try:
+                return {str(item) for item in self._grammar_provider() if str(item).strip()}
+            except Exception:
+                log.exception("Grammar provider failed")
+        registry = getattr(self.command_router, "registry", None)
+        if registry is not None:
+            try:
+                return set(registry.phrases())
+            except Exception:
+                log.debug("Could not read registry phrases", exc_info=True)
+        return set()
+
+    def refresh_grammar(self) -> None:
+        """Rebuild the command grammar and schedule a thread-safe application.
+
+        The Vosk model is never reloaded and the microphone is not restarted;
+        the listener thread applies the new grammar between audio blocks.
+        """
+        phrases = self._grammar_source()
+        grammar = build_recognition_grammar(phrases)
+        with self._grammar_lock:
+            self._grammar_phrases = {str(p) for p in phrases}
+            self._grammar_json = grammar
+        self._grammar_dirty.set()
+
+    def _current_grammar(self) -> str:
+        with self._grammar_lock:
+            return self._grammar_json
+
+    def _apply_grammar(self, recognizer):
+        """Swap in a recogniser built from the latest command vocabulary.
+
+        This runs in the listener thread and never restarts the microphone or
+        reloads the Vosk model.  A fresh recogniser is used instead of
+        SetGrammar because SetGrammar drops words that are missing from the
+        model's word list (for example "unmute").
+        """
+        if not self._grammar_dirty.is_set():
+            return recognizer
+        self._grammar_dirty.clear()
+        if not self._current_grammar() or self._model is None:
+            return recognizer
+        try:
+            fresh = self._make_recognizer()
+            log.info("Recognition grammar refreshed (%d phrases)", len(self._grammar_phrases))
+            return fresh
+        except Exception:
+            log.exception("Could not refresh the recognition grammar; keeping the previous one")
+            return recognizer
+
+    def _make_recognizer(self, wake: bool = False):
+        from vosk import KaldiRecognizer
+
+        grammar = WAKE_GRAMMAR if wake else self._current_grammar()
+        try:
+            recognizer = (
+                KaldiRecognizer(self._model, SAMPLE_RATE, grammar) if grammar
+                else KaldiRecognizer(self._model, SAMPLE_RATE)
+            )
+        except Exception:
+            log.exception("Grammar recogniser could not be created; using generic recognition")
+            recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
+        if not wake:
+            try:
+                recognizer.SetMaxAlternatives(N_ALTERNATIVES)
+            except Exception:
+                log.debug("Recognition alternatives are not supported", exc_info=True)
+        return recognizer
 
     # -- helpers -----------------------------------------------------------
     def _set_status(self, text: str) -> None:
@@ -298,10 +432,7 @@ class VoiceController:
                         pass
 
             try:
-                if self.always_listen:
-                    recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
-                else:
-                    recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, WAKE_GRAMMAR)
+                recognizer = self._make_recognizer(wake=not self.always_listen)
                 with sd.RawInputStream(
                     samplerate=SAMPLE_RATE,
                     blocksize=BLOCK_SIZE,
@@ -344,45 +475,94 @@ class VoiceController:
     def _listen_loop(self, audio_q: queue.Queue, recognizer) -> None:
         """Always-on command recognition: no wake word and no beep.
 
-        Only exact, known command phrases are executed.  Anything else is
-        ignored silently, so background noise can never trigger the old
-        "Sorry, I didn't catch that" loop.
+        Final segments are accumulated for a short, bounded window so a long
+        command split by Vosk is still matched exactly.  Only exact registered
+        phrases run; everything else is ignored (or asks for one repeat when it
+        clearly sounds like a command attempt).
         """
         self._continuous = True
-        self._recent.clear()
+        self._assembler.reset()
+        voiced_blocks = 0
+        voiced_peak = 0.0
         try:
             while not self._stop.is_set():
+                # Grammar updates are applied here, in the listener thread, so
+                # the microphone and model are never touched from the UI thread.
+                updated = self._apply_grammar(recognizer)
+                if updated is not recognizer:
+                    recognizer = updated
+                    voiced_blocks = 0
+                    voiced_peak = 0.0
+
                 # Never listen while NOVA is speaking, otherwise it hears itself.
                 if self._speech_is_speaking():
                     self._drain(audio_q)
                     self._reset(recognizer)
+                    voiced_blocks = 0
+                    voiced_peak = 0.0
                     self._stop.wait(0.05)
                     continue
 
                 try:
                     pcm = audio_q.get(timeout=0.25)
                 except queue.Empty:
+                    if self._assembler.expire():
+                        self._set_status("Listening continuously")
                     continue
+
+                # Clear a stale pending phrase even while audio keeps arriving.
+                if self._assembler.expire():
+                    self._set_status("Listening continuously")
 
                 if self._speech_is_speaking():
                     self._drain(audio_q)
                     self._reset(recognizer)
+                    voiced_blocks = 0
+                    voiced_peak = 0.0
                     continue
+
+                level = _rms(pcm)
+                if level >= SPEECH_RMS_THRESHOLD:
+                    voiced_blocks += 1
+                    voiced_peak = max(voiced_peak, level)
 
                 try:
                     if not recognizer.AcceptWaveform(pcm):
                         continue
-                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                    texts = _result_texts(json.loads(recognizer.Result()))
                 except Exception:
                     log.exception("Continuous recognizer failed")
                     return
-                if not text:
+                # Never treat an unknown-word marker as a command.
+                texts = [item for item in texts if not _has_unknown(item)]
+                if not texts:
+                    voiced_blocks = 0
+                    voiced_peak = 0.0
                     continue
-                if self._dispatch_transcript(text, audio_q, recognizer) not in (
-                    None, "none", "unknown",
-                ):
+                # A final with no voiced audio is noise or silence decoded as a
+                # short command; it must never execute.
+                if voiced_blocks < MIN_FINAL_BLOCKS:
+                    log.info(
+                        "Ignored a final without voiced audio: %s (level=%.0f)",
+                        " | ".join(texts), voiced_peak,
+                    )
+                    self._reset(recognizer)
+                    voiced_blocks = 0
+                    voiced_peak = 0.0
+                    continue
+                log.info(
+                    "Heard: %s (level=%.0f, voiced=%d)",
+                    " | ".join(texts), voiced_peak, voiced_blocks,
+                )
+                action = self._dispatch_transcript(
+                    texts[0], audio_q, recognizer, alternatives=texts[1:]
+                )
+                voiced_blocks = 0
+                voiced_peak = 0.0
+                if action not in (None, "none", "unknown"):
                     # A command ran: drop any audio from its spoken reply.
-                    self._wait_for_speech_end(20.0)
+                    if not self._wait_for_speech_end(20.0):
+                        log.warning("Speech output stayed busy; resuming listening")
                     self._drain(audio_q)
                     self._reset(recognizer)
                     self.face_callback("idle")
@@ -390,49 +570,78 @@ class VoiceController:
         finally:
             self._continuous = False
 
-    def _dispatch_transcript(self, text: str, audio_q: queue.Queue, recognizer) -> str | None:
-        """Match a final transcript, joining short fragments if needed.
+    def _dispatch_transcript(self, text: str, audio_q: queue.Queue, recognizer,
+                             alternatives=None) -> str | None:
+        """Match a final transcript through the bounded phrase assembler.
 
-        Vosk sometimes ends a phrase early, so "study" and "mode" can arrive as
-        two finals.  The last few fragments are tried longest-first, which makes
-        multi-word commands reliable without any fuzzy matching.
+        Vosk may finalise a command in several segments, and its own alternative
+        hypotheses are exact-matched too.  No similarity scoring is used.
         """
         now = time.monotonic()
-        self._recent = [(part, stamp) for part, stamp in self._recent if now - stamp <= 2.5]
-        self._recent.append((text, now))
-        if len(self._recent) > 5:
-            del self._recent[:-5]
+        texts = [item for item in [text, *(alternatives or [])] if not _has_unknown(item)]
+        if not texts:
+            return None
+        assembly = self._assembler.add(texts, now=now)
+        if assembly.heard:
+            self._emit("last_heard", assembly.heard)
 
-        candidates: list[str] = []
-        for count in (5, 4, 3, 2, 1):
-            if len(self._recent) >= count:
-                candidate = " ".join(part for part, _ in self._recent[-count:]).strip()
-                if candidate and candidate not in candidates:
-                    candidates.append(candidate)
+        if assembly.pending:
+            self._set_status(f"Heard: {assembly.heard} …")
+            return None
 
-        for candidate in candidates:
-            if (candidate == self._last_executed[0]
-                    and now - self._last_executed[1] < 2.0):
+        weak = {
+            normalize_phrase(item)
+            for item in (alternatives or [])[max(0, DESTRUCTIVE_ALTERNATIVES - 1):]
+        }
+        attempts = [assembly.matched] if assembly.matched else list(assembly.candidates)
+        for index, candidate in enumerate(attempts):
+            if not candidate:
                 continue
-            action = self._execute_phrase(candidate)
+            if self._is_destructive(candidate) and candidate in weak:
+                log.info("Ignored a weak destructive hypothesis: %s", candidate)
+                continue
+            if (candidate == self._last_executed[0]
+                    and now - self._last_executed[1] < COMMAND_DEBOUNCE):
+                self._assembler.reset()
+                return None
+            action = self._execute_phrase(candidate, primary=index == 0)
             if action not in (None, "none", "unknown"):
-                self._recent.clear()
+                self._assembler.reset()
                 self._last_executed = (candidate, now)
                 return action
+        if assembly.heard:
+            self._handle_unintelligible(assembly.heard, audio_q)
         return None
 
-    def _execute_phrase(self, phrase: str) -> str:
+    def _is_destructive(self, phrase: str) -> bool:
+        registry = getattr(self.command_router, "registry", None)
+        matcher = getattr(registry, "match", None)
+        if not callable(matcher):
+            return False
         try:
-            action = self.command_router.handle(phrase, announce_unknown=False)
-        except TypeError:
-            action = self.command_router.handle(phrase)
+            command = matcher(phrase)
         except Exception:
+            return False
+        return command is not None and getattr(command, "action", "") in DESTRUCTIVE_ACTIONS
+
+    def _execute_phrase(self, phrase: str, primary: bool = True) -> str:
+        try:
+            try:
+                action = self.command_router.handle(phrase, announce_unknown=False)
+            except TypeError:
+                action = self.command_router.handle(phrase)
+        except Exception as exc:
+            # The phrase matched but the action itself failed.  This is an
+            # execution failure, not a recognition failure.
             log.exception("Command handling failed")
-            return "unknown"
+            self._emit("last_match", phrase)
+            self._emit("last_command", phrase)
+            self._emit("last_result", f"Action failed: {exc}")
+            return "failed"
         if action in (None, "none", "unknown"):
             log.info("Ignored unrecognized speech: %s", phrase)
             return "unknown"
-        self._emit("last_heard", phrase)
+        self._emit("last_match", phrase)
         self._emit("last_command", phrase)
         if not str(action).startswith(("custom", "automation")):
             self._emit("last_result", f"Executed: {action}")
@@ -505,9 +714,7 @@ class VoiceController:
                 return
 
             if recognizer is None:
-                from vosk import KaldiRecognizer
-
-                recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
+                recognizer = self._make_recognizer()
 
             phrase, heard_speech, aborted = self._capture(audio_q, recognizer)
             if self._stop.is_set() or aborted:
@@ -517,29 +724,16 @@ class VoiceController:
                 self._emit("last_result", "No speech detected")
                 return
             if not phrase:
-                # CASE B: speech but nothing intelligible.
-                self._handle_unintelligible(audio_q)
+                # CASE B: speech but nothing intelligible. Never execute.
+                self._emit("last_failure", "Speech heard but no words recognised")
                 return
 
             # CASE C: a transcript exists; the deterministic router decides.
             self._emit("last_heard", phrase)
             self._set_status(f"Heard: {phrase}")
-            try:
-                action = self.command_router.handle(phrase, announce_unknown=False)
-            except TypeError:
-                # Older routers without the keyword argument.
-                action = self.command_router.handle(phrase)
-            except Exception:
-                log.exception("Command handling failed")
-                action = "unknown"
-
+            action = self._execute_phrase(phrase)
             if action in (None, "none", "unknown"):
-                self._handle_unintelligible(audio_q)
-            else:
-                self._emit("last_command", phrase)
-                # Custom commands and automations report their own real result.
-                if not str(action).startswith(("custom", "automation")):
-                    self._emit("last_result", f"Executed: {action}")
+                self._handle_unintelligible(phrase, audio_q)
             # Wait for any spoken confirmation before reopening the microphone.
             self._wait_for_speech_end(20.0)
             self._drain(audio_q)
@@ -558,22 +752,55 @@ class VoiceController:
         self._gate_microphone(audio_q, SETTLE_SECONDS)
         self._drain(audio_q)
 
-    def _handle_unintelligible(self, audio_q: queue.Queue) -> None:
-        """Ignore speech that did not match a command; never nag the user."""
+    def _handle_unintelligible(self, text: str, audio_q: queue.Queue) -> None:
+        """Ask for one repeat only when the utterance sounded like a command.
+
+        Unrelated background conversation is ignored silently, and a cooldown
+        prevents an apology loop.  Nothing is executed here.
+        """
+        phrase = normalize_phrase(text)
+        if not phrase:
+            self._drain(audio_q)
+            return
+        if not is_command_like(phrase, self._vocabulary() or ()):
+            # Ordinary chatter is not a recognition failure, so leave the
+            # diagnostics untouched and stay silent.
+            self._drain(audio_q)
+            return
+        self._emit("last_failure", "No matching registered command")
         self._set_status("Speech detected · no matching command")
-        self._emit("last_result", "No matching command")
+        now = time.monotonic()
+        if now - self._last_repeat_at < REPEAT_COOLDOWN:
+            self._drain(audio_q)
+            return
+        self._last_repeat_at = now
+        speech = self._speech
+        if speech is not None and getattr(speech, "enabled", False):
+            try:
+                say_and_wait = getattr(speech, "say_and_wait", None)
+                if callable(say_and_wait):
+                    say_and_wait(REPEAT_MESSAGE, 15.0)
+                else:
+                    speech.say(REPEAT_MESSAGE)
+                    self._wait_for_speech_end(15.0)
+            except Exception:
+                log.exception("Could not speak the repeat request")
+        self._wait_for_speech_end(15.0)
         self._drain(audio_q)
 
     def _capture(self, audio_q: queue.Queue, recognizer) -> tuple[str, bool, bool]:
         """Return (text, heard_speech, aborted).
 
-        Silence is detected with a small RMS threshold, so a command is not cut
-        off and background noise does not create endless listening sessions.
+        Every final segment is accumulated until the user stops speaking, so a
+        command is not truncated when Vosk finalises its first short segment.
+        Silence is detected with a small RMS threshold, and the phrase is only
+        returned after the trailing-silence window has elapsed.
         """
         started = time.monotonic()
         last_voice = started
         speech_blocks = 0
         heard_speech = False
+        finals: list[str] = []
 
         while time.monotonic() - started < COMMAND_MAX_SECONDS:
             if self._stop.is_set():
@@ -598,10 +825,14 @@ class VoiceController:
 
             try:
                 if recognizer.AcceptWaveform(data):
-                    text = json.loads(recognizer.Result()).get("text", "").strip()
-                    if text:
-                        log.info("Voice command recognized: %s", text)
-                        return text, True, False
+                    for item in _result_texts(json.loads(recognizer.Result())):
+                        if _has_unknown(item):
+                            continue
+                        if not finals or item != finals[-1]:
+                            finals.append(item)
+                        break
+                    if finals:
+                        heard_speech = True
             except Exception:
                 log.exception("Command recognition failed")
                 return "", heard_speech, False
@@ -610,12 +841,19 @@ class VoiceController:
                 break
 
         try:
-            text = json.loads(recognizer.FinalResult()).get("text", "").strip()
+            for item in _result_texts(json.loads(recognizer.FinalResult())):
+                if _has_unknown(item):
+                    continue
+                if not finals or item != finals[-1]:
+                    finals.append(item)
+                break
         except Exception:
-            text = ""
-        if text:
+            log.debug("Could not read the final recognition result", exc_info=True)
+        phrase = normalize_phrase(" ".join(finals))
+        if phrase:
             heard_speech = True
-        return text, heard_speech, False
+            log.info("Voice command recognized: %s", phrase)
+        return phrase, heard_speech, False
 
     # -- manual listening when the wake loop is not running ----------------
     def _manual_session(self) -> None:

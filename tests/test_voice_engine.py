@@ -123,6 +123,38 @@ def test_queue_is_bounded_by_dropping_oldest_frames():
     assert audio_q.qsize() == 2
 
 
+def test_continuous_mode_ignores_a_final_without_voiced_audio():
+    controller, router, _speech = make_controller({"always_listen": True})
+    controller._model = None
+    controller._grammar_dirty.clear()
+    audio_q: queue.Queue = queue.Queue()
+    audio_q.put(SILENT)
+    thread = threading.Thread(
+        target=controller._listen_loop, args=(audio_q, FakeRecognizer("hide")), daemon=True
+    )
+    thread.start()
+    time.sleep(0.5)
+    controller._stop.set()
+    thread.join(timeout=2.0)
+    assert router.handled == [], "noise must never execute a short command"
+
+
+def test_continuous_mode_accepts_a_final_after_voiced_audio():
+    controller, router, _speech = make_controller({"always_listen": True})
+    controller._model = None
+    controller._grammar_dirty.clear()
+    audio_q: queue.Queue = queue.Queue()
+    audio_q.put(LOUD)
+    thread = threading.Thread(
+        target=controller._listen_loop, args=(audio_q, FakeRecognizer("hide")), daemon=True
+    )
+    thread.start()
+    time.sleep(0.5)
+    controller._stop.set()
+    thread.join(timeout=2.0)
+    assert router.handled and router.handled[0][0] == "hide"
+
+
 def test_capture_reports_silence_as_case_a(monkeypatch):
     fast(monkeypatch)
     controller, _router, _speech = make_controller()

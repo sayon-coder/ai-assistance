@@ -4,14 +4,17 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import nova.custom as custom
+from nova.commands import build_builtin_registry
 from nova.custom import (
     ActionExecutor, AutomationRunner, CustomStore, validate_automation,
     validate_command, validate_step,
 )
+from nova.runtime import NovaRuntime
 
 RESERVED = {"study mode", "open settings", "nova", "hey nova"}
 
@@ -222,6 +225,69 @@ def test_invalid_url_action_fails_safely():
     ok, message = executor.open_url("javascript:alert(1)")
     assert ok is False
     assert "invalid" in message.lower()
+
+
+def test_batch_files_use_cmd_exe_without_a_shell(tmp_path, monkeypatch):
+    batch = tmp_path / "start.bat"
+    batch.write_text("echo hello", encoding="utf-8")
+    calls = []
+
+    class FakeProcess:
+        pid = 111
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(custom.subprocess, "Popen", fake_popen)
+    executor = ActionExecutor(app=None)
+    ok, message = executor.open_app(str(batch), ["one"])
+    assert ok is True
+    assert calls[0][0] == ["cmd.exe", "/c", str(batch), "one"]
+    assert "shell" not in calls[0][1]
+
+
+def test_unsupported_application_type_is_rejected(tmp_path):
+    script = tmp_path / "script.ps1"
+    script.write_text("Write-Host unsafe", encoding="utf-8")
+    executor = ActionExecutor(app=None)
+    ok, message = executor.open_app(str(script))
+    assert ok is False
+    assert "unsupported" in message.lower()
+
+
+def test_custom_trigger_uses_the_models_spoken_form(tmp_path):
+    store = CustomStore(tmp_path / "custom_commands.json", reserved_phrases=RESERVED)
+    saved = store.save_command({
+        "name": "Unmute music",
+        "triggers": ["unmute music"],
+        "action": "open_url",
+        "params": {"url": "https://music.example"},
+    })
+    assert store.match("unmute music")["id"] == saved["id"]
+    assert store.match("un mute music")["id"] == saved["id"]
+
+
+def test_test_phrase_reports_a_match_without_executing(tmp_path):
+    store = CustomStore(tmp_path / "custom_commands.json", reserved_phrases=RESERVED)
+    store.save_command(command())
+    runtime = NovaRuntime.__new__(NovaRuntime)
+    runtime.commands = SimpleNamespace(registry=build_builtin_registry())
+    runtime.custom = store
+
+    result = runtime.test_phrase("Open my code editor.")
+    assert result["matched"] is True
+    assert result["kind"] == "command"
+    assert result["name"] == "Open editor"
+
+    builtin = runtime.test_phrase("Study mode")
+    assert builtin["matched"] is True
+    assert builtin["kind"] == "builtin"
+    assert builtin["action"] == "study"
+
+    missing = runtime.test_phrase("make me a sandwich")
+    assert missing["matched"] is False
+    assert "No enabled" in missing["reason"]
 
 
 # -- automation ordering and duplicate prevention ---------------------------

@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 
-from .commands import normalize_phrase
+from .commands import normalize_phrase, spoken_form
 from .config import CUSTOM_COMMANDS_PATH, ROOT, resolve_path, write_json
 from .modes import normalize_url
 
@@ -26,6 +26,7 @@ log = logging.getLogger("nova.custom")
 COMMAND_ACTIONS = ("open_app", "open_url", "activate_mode", "wait")
 STEP_ACTIONS = ("open_app", "close_app", "open_url", "activate_mode", "wait")
 MODE_NAMES = ("study", "entertainment")
+SUPPORTED_APP_SUFFIXES = {".exe", ".lnk", ".url", ".bat", ".cmd"}
 
 ACTION_LABELS = {
     "open_app": "Open an application",
@@ -264,15 +265,20 @@ class CustomStore:
         phrase = normalize_phrase(text)
         if not phrase:
             return None
+        heard = spoken_form(phrase)
         with self._lock:
             for kind in ("commands", "automations"):
                 for entry in self._entries(kind):
                     if not entry.get("enabled", True):
                         continue
-                    if phrase in entry.get("triggers", []):
-                        result = copy.deepcopy(entry)
-                        result["kind"] = "command" if kind == "commands" else "automation"
-                        return result
+                    for trigger in entry.get("triggers", []):
+                        # Compare the form the speech model actually produces,
+                        # so "un mute music" still matches an "unmute music"
+                        # trigger.
+                        if phrase == trigger or heard == spoken_form(trigger):
+                            result = copy.deepcopy(entry)
+                            result["kind"] = "command" if kind == "commands" else "automation"
+                            return result
         return None
 
     # -- mutations ---------------------------------------------------------
@@ -343,9 +349,19 @@ class ActionExecutor:
         return target
 
     def _launch(self, path: Path, args: list[str]):
-        if path.suffix.lower() in {".lnk", ".url"}:
+        suffix = path.suffix.lower()
+        if suffix in {".lnk", ".url"}:
             os.startfile(str(path))  # noqa: S606 - user-configured shortcut
             return None
+        if suffix in {".bat", ".cmd"}:
+            # Batch files need an explicit interpreter; shell=True is never used.
+            return subprocess.Popen(
+                ["cmd.exe", "/c", str(path), *args],
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        if suffix != ".exe":
+            raise ValueError(f"Unsupported application type: {suffix or 'no extension'}")
         return subprocess.Popen(
             [str(path), *args], close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -355,6 +371,11 @@ class ActionExecutor:
         target = self._resolve(path)
         if not target.exists():
             return False, f"Application not found: {target}"
+        if target.suffix.lower() not in SUPPORTED_APP_SUFFIXES:
+            return False, (
+                f"Unsupported application type: {target.suffix or 'no extension'}. "
+                "Choose an .exe, .lnk, .url, .bat or .cmd file."
+            )
         try:
             process = self.app_launcher(target, _clean_args(args))
         except Exception as exc:

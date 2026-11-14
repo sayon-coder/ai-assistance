@@ -47,6 +47,23 @@ def test_corrupt_settings_recovered(monkeypatch, tmp_path):
     assert list(tmp_path.glob("settings.json.invalid-*"))
 
 
+def test_always_listen_and_phrase_timeout_are_normalised(monkeypatch, tmp_path):
+    use_temp_paths(monkeypatch, tmp_path)
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "always_listen": "yes",
+        "phrase_timeout": 99,
+    }), encoding="utf-8")
+    settings = config.load_settings()
+    assert settings["always_listen"] is True
+    assert settings["phrase_timeout"] == 8.0
+
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "phrase_timeout": "not a number",
+    }), encoding="utf-8")
+    settings = config.load_settings()
+    assert settings["phrase_timeout"] == 4.0
+
+
 def test_modes_are_normalised(monkeypatch, tmp_path):
     use_temp_paths(monkeypatch, tmp_path)
     (tmp_path / "modes.json").write_text(json.dumps({

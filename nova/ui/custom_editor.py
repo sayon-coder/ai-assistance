@@ -6,10 +6,11 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-    QPushButton, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
+from ..commands import normalize_phrase
 from ..custom import ACTION_LABELS, COMMAND_ACTIONS, MODE_NAMES, STEP_ACTIONS
 from . import theme
 from .components import Card, Heading, Switch, footnote, muted
@@ -21,6 +22,34 @@ def _triggers_text(entry: dict) -> str:
 
 def _parse_triggers(text: str) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def _trigger_preview(runtime, text: str, exclude_id: str | None = None) -> str:
+    """Show the normalised phrases and any conflict before saving."""
+    normalized: list[str] = []
+    for line in str(text or "").splitlines():
+        phrase = normalize_phrase(line)
+        if phrase and phrase not in normalized:
+            normalized.append(phrase)
+    if not normalized:
+        return "No trigger phrases yet. If left empty, the name is used as the trigger."
+    reserved = set(runtime.reserved_command_phrases())
+    used: set[str] = set()
+    data = runtime.custom_snapshot()
+    for kind in ("commands", "automations"):
+        for entry in data.get(kind, []):
+            if exclude_id and entry.get("id") == exclude_id:
+                continue
+            used.update(entry.get("triggers", []))
+    lines: list[str] = []
+    for phrase in normalized:
+        if phrase in reserved:
+            lines.append(f"• {phrase} — conflicts with a built-in command")
+        elif phrase in used:
+            lines.append(f"• {phrase} — already used by another custom entry")
+        else:
+            lines.append(f"• {phrase}")
+    return "\n".join(lines)
 
 
 def _step_summary(step: dict, index: int) -> str:
@@ -162,14 +191,23 @@ class CommandDialog(_BaseDialog):
         form.setSpacing(9)
         self.name = QLineEdit(str(self.entry.get("name", "")))
         self.name.setPlaceholderText("Open Visual Studio Code")
-        form.addRow("Name", self.name)
+        form.addRow("Command name", self.name)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("Spoken trigger phrases (one per line)"))
+        layout.addWidget(QLabel(
+            "Spoken trigger phrases — exactly what you say, one per line"
+        ))
         self.triggers = QPlainTextEdit(_triggers_text(self.entry))
         self.triggers.setPlaceholderText("Open Visual Studio Code\nStart VS Code\nLaunch my code editor")
         self.triggers.setFixedHeight(110)
         layout.addWidget(self.triggers)
+        self.trigger_preview = QLabel("")
+        self.trigger_preview.setObjectName("Footnote")
+        self.trigger_preview.setWordWrap(True)
+        self.trigger_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.trigger_preview)
+        self.triggers.textChanged.connect(self._update_preview)
+        self._update_preview()
 
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("Action"))
@@ -212,11 +250,21 @@ class CommandDialog(_BaseDialog):
     def _rebuild(self) -> None:
         self.params.build(self.action.currentData(), self.entry.get("params", {}))
 
+    def _update_preview(self) -> None:
+        self.trigger_preview.setText(
+            _trigger_preview(self.runtime, self.triggers.toPlainText(), self.entry.get("id"))
+        )
+
     def _save(self) -> None:
+        name = self.name.text().strip()
+        triggers = _parse_triggers(self.triggers.toPlainText())
+        if not triggers and name and not self.entry.get("id"):
+            # New command: use the name as the first spoken phrase.
+            triggers = [name]
         entry = {
-            "name": self.name.text().strip(),
+            "name": name,
             "enabled": self.enabled.isChecked(),
-            "triggers": _parse_triggers(self.triggers.toPlainText()),
+            "triggers": triggers,
             "action": self.action.currentData(),
             "params": self.params.params(),
         }
@@ -326,14 +374,23 @@ class AutomationDialog(_BaseDialog):
         form.setSpacing(9)
         self.name = QLineEdit(str(self.entry.get("name", "")))
         self.name.setPlaceholderText("Start my study session")
-        form.addRow("Name", self.name)
+        form.addRow("Automation name", self.name)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("Spoken trigger phrases (one per line)"))
+        layout.addWidget(QLabel(
+            "Spoken trigger phrases — exactly what you say, one per line"
+        ))
         self.triggers = QPlainTextEdit(_triggers_text(self.entry))
         self.triggers.setPlaceholderText("Prepare my study session\nStart my study setup")
         self.triggers.setFixedHeight(90)
         layout.addWidget(self.triggers)
+        self.trigger_preview = QLabel("")
+        self.trigger_preview.setObjectName("Footnote")
+        self.trigger_preview.setWordWrap(True)
+        self.trigger_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.trigger_preview)
+        self.triggers.textChanged.connect(self._update_preview)
+        self._update_preview()
 
         layout.addWidget(QLabel("Ordered steps"))
         self.step_list = QListWidget()
@@ -416,11 +473,20 @@ class AutomationDialog(_BaseDialog):
         self.steps[row], self.steps[target] = self.steps[target], self.steps[row]
         self._refresh_steps(target)
 
+    def _update_preview(self) -> None:
+        self.trigger_preview.setText(
+            _trigger_preview(self.runtime, self.triggers.toPlainText(), self.entry.get("id"))
+        )
+
     def _save(self) -> None:
+        name = self.name.text().strip()
+        triggers = _parse_triggers(self.triggers.toPlainText())
+        if not triggers and name and not self.entry.get("id"):
+            triggers = [name]
         entry = {
-            "name": self.name.text().strip(),
+            "name": name,
             "enabled": self.enabled.isChecked(),
-            "triggers": _parse_triggers(self.triggers.toPlainText()),
+            "triggers": triggers,
             "steps": self.steps,
         }
         try:
@@ -467,7 +533,9 @@ class CustomEditor(QWidget):
         delete_command.clicked.connect(self._delete_command)
         toggle_command = QPushButton("Enable / disable")
         toggle_command.clicked.connect(self._toggle_command)
-        for widget in (new_command, edit_command, delete_command, toggle_command):
+        test_phrase = QPushButton("Test a phrase…")
+        test_phrase.clicked.connect(self._test_phrase)
+        for widget in (new_command, edit_command, delete_command, toggle_command, test_phrase):
             command_buttons.addWidget(widget)
         command_buttons.addStretch(1)
         commands.add_layout(command_buttons)
@@ -563,6 +631,36 @@ class CustomEditor(QWidget):
         if entry:
             self.runtime.set_custom_command_enabled(entry_id, not entry.get("enabled", True))
             self.refresh()
+
+    def _test_phrase(self) -> None:
+        """Check a typed phrase against the registry without executing it."""
+        text, accepted = QInputDialog.getText(
+            self, "Test a phrase",
+            "Type the phrase exactly as you would say it:",
+        )
+        if not accepted or not str(text).strip():
+            return
+        result = self.runtime.test_phrase(str(text))
+        if result.get("matched"):
+            labels = {
+                "builtin": "Built-in command",
+                "command": "Custom command",
+                "automation": "Automation",
+            }
+            kind = labels.get(result.get("kind"), result.get("kind", "Command"))
+            QMessageBox.information(
+                self, "Phrase matched",
+                f"Recognised: {result.get('phrase')}\n"
+                f"Matches: {result.get('name')}\n"
+                f"Type: {kind}\n\nNothing was executed.",
+            )
+        else:
+            QMessageBox.warning(
+                self, "No match",
+                f"Recognised: {result.get('phrase') or text}\n\n"
+                f"{result.get('reason', 'No matching command.')}\n\n"
+                "Nothing was executed.",
+            )
 
     # -- automations -------------------------------------------------------
     def _new_automation(self) -> None:

@@ -8,6 +8,7 @@ The registry also makes duplicate/conflicting phrases impossible to add.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -20,10 +21,24 @@ _WAKE_PREFIXES = (
 )
 _WAKE_WORDS = {"nova", "hey nova", "okay nova", "ok nova", "no va"}
 _POLITE_PREFIXES = (
-    "please ", "kindly ", "can you ", "could you ", "would you ", "will you ",
-    "i want you to ", "i would like you to ", "i want to ", "just ",
+    "you know what ", "please ", "kindly ", "can you ", "could you ",
+    "would you ", "will you ", "i want you to ", "i would like you to ",
+    "i want to ", "just ", "hey ", "okay ", "ok ", "so ", "um ", "uh ",
+    "well ",
 )
 _POLITE_SUFFIXES = (" please",)
+
+# Utterances that begin with one of these verbs are treated as failed command
+# attempts rather than unrelated background conversation.  This keeps the
+# single "please repeat" request deterministic and avoids nagging on chatter.
+# Only imperative/action words belong here: ordinary questions and statements
+# must stay silent.
+_COMMAND_INTENT_PREFIXES = {
+    "open", "launch", "start", "activate", "switch", "mute", "unmute",
+    "enable", "disable", "hide", "show", "exit", "close", "quit", "stop",
+    "begin", "prepare", "listen", "capture", "take", "turn", "set", "run",
+    "play",
+}
 
 
 def normalize_phrase(phrase: str) -> str:
@@ -36,6 +51,8 @@ def normalize_phrase(phrase: str) -> str:
     text = str(phrase or "").lower().strip()
     text = _PUNCTUATION.sub(" ", text)
     text = " ".join(text.split())
+    # Vosk often truncates "mode" to "mod" in short phrases.
+    text = re.sub(r"\bmod\b", "mode", text)
     changed = True
     while changed and text:
         changed = False
@@ -48,6 +65,52 @@ def normalize_phrase(phrase: str) -> str:
         if text.endswith(suffix):
             text = text[: -len(suffix)].strip()
     return text
+
+
+def is_command_like(phrase: str, vocabulary=()) -> bool:
+    """Deterministic guess: could this utterance be a failed command attempt?
+
+    Only used to decide whether to ask the user to repeat.  It never executes
+    anything and never changes command matching.
+    """
+    text = normalize_phrase(phrase)
+    if not text:
+        return False
+    if text.split()[0] in _COMMAND_INTENT_PREFIXES:
+        return True
+    prefix = text + " "
+    return any(str(known).startswith(prefix) for known in vocabulary if known)
+
+
+# Words that the installed small model cannot pronounce as one token.  Vosk
+# drops a grammar phrase entirely when one of its words is missing from the
+# model's word list (it logs "Ignoring word missing in vocabulary"), so the
+# grammar uses the spoken form instead.  The registry registers both spellings,
+# which keeps recognition exact.
+_GRAMMAR_SPOKEN_FORMS = {
+    "unmute": "un mute",
+}
+
+
+def spoken_form(phrase: str) -> str:
+    """Return the form of a phrase that the installed Vosk model can decode."""
+    words = normalize_phrase(phrase).split()
+    return " ".join(_GRAMMAR_SPOKEN_FORMS.get(word, word) for word in words)
+
+
+def build_recognition_grammar(phrases, include_unknown: bool = True) -> str:
+    """Build the Vosk phrase-list grammar from normalised command phrases."""
+    clean: list[str] = []
+    for phrase in phrases or ():
+        if "[unk]" in str(phrase).lower():
+            continue
+        normalized = spoken_form(phrase)
+        if normalized and normalized not in clean:
+            clean.append(normalized)
+    clean.sort()
+    if include_unknown:
+        clean.append("[unk]")
+    return json.dumps(clean, ensure_ascii=False)
 
 
 class CommandConflictError(ValueError):
@@ -100,6 +163,14 @@ class CommandRegistry:
     def match(self, text: str) -> Command | None:
         return self._by_phrase.get(normalize_phrase(text))
 
+    def is_prefix(self, text: str) -> bool:
+        """True when the phrase is a proper prefix of a registered command."""
+        phrase = normalize_phrase(text)
+        if not phrase:
+            return False
+        prefix = phrase + " "
+        return any(known.startswith(prefix) for known in self._by_phrase)
+
     def phrases(self) -> set[str]:
         return set(self._by_phrase)
 
@@ -115,10 +186,12 @@ def build_builtin_registry() -> CommandRegistry:
         "study",
         (
             "study mode", "study", "activate study mode", "activate my study mode",
-            "start study mode", "start study", "start studying", "begin study mode",
-            "begin studying", "open study mode", "prepare my study environment",
-            "prepare study environment", "prepare my study", "get me ready for study",
-            "get ready for study", "get ready for my study mode", "ready for study",
+            "start study mode", "start my study mode", "start study", "start studying",
+            "begin study mode", "begin study", "begin studying", "open study mode",
+            "open my study mode", "switch to study mode", "switch to my study mode",
+            "prepare study", "prepare my study", "prepare my study environment",
+            "prepare study environment", "get me ready for study", "get ready for study",
+            "get ready for my study mode", "ready for study",
         ),
         "Activate Study Mode.",
     )
@@ -127,8 +200,11 @@ def build_builtin_registry() -> CommandRegistry:
         (
             "entertainment mode", "entertainment", "activate entertainment mode",
             "activate my entertainment mode", "start entertainment",
-            "start entertainment mode", "open entertainment mode", "music mode",
-            "start music mode", "prepare my entertainment environment",
+            "start entertainment mode", "start my entertainment mode",
+            "begin entertainment", "begin entertainment mode",
+            "open entertainment mode", "open my entertainment mode",
+            "switch to entertainment mode", "switch to my entertainment mode",
+            "music mode", "start music mode", "prepare my entertainment environment",
             "prepare entertainment environment", "prepare entertainment",
             "get me ready for entertainment", "get ready for entertainment",
             "get ready for my entertainment mode", "ready for entertainment",
@@ -137,12 +213,14 @@ def build_builtin_registry() -> CommandRegistry:
     )
     registry.register(
         "mute",
-        ("mute", "mute voice", "mute yourself", "be quiet", "silence", "stop speaking"),
+        ("mute", "mute voice", "mute yourself", "be quiet", "silence", "stop speaking",
+         "disable voice", "turn off voice", "stop voice"),
         "Mute NOVA's spoken output.",
     )
     registry.register(
         "unmute",
-        ("unmute", "unmute voice", "voice on", "speak again", "you can talk", "enable voice"),
+        ("unmute", "unmute voice", "un mute", "un mute voice", "voice on",
+         "speak again", "you can talk", "enable voice", "turn on voice"),
         "Unmute NOVA's spoken output.",
     )
     registry.register(
@@ -171,7 +249,7 @@ def build_builtin_registry() -> CommandRegistry:
         (
             "open settings", "open the settings", "settings", "configuration",
             "open configuration", "open control center", "control center",
-            "open nova settings",
+            "open nova settings", "open my settings", "nova settings",
         ),
         "Open the NOVA Control Center.",
     )
@@ -239,6 +317,17 @@ class CommandRouter:
     def reserved_phrases(self) -> set[str]:
         return self.registry.phrases() | set(_WAKE_WORDS)
 
+    def recognition_phrases(self) -> set[str]:
+        """Every enabled built-in phrase, for the Vosk command grammar."""
+        return self.registry.phrases()
+
+    def match_phrase(self, phrase: str) -> Command | None:
+        return self.registry.match(phrase)
+
+    def looks_like_command(self, phrase: str, vocabulary=()) -> bool:
+        known = self.registry.phrases() | set(vocabulary or ())
+        return is_command_like(phrase, known)
+
     def handle(self, phrase: str, announce_unknown: bool = True) -> str:
         text = normalize_phrase(phrase)
         log.info("Recognized command: %s", text or "(empty)")
@@ -260,7 +349,7 @@ class CommandRouter:
 
         log.info("Unrecognized command: %s", text)
         if announce_unknown:
-            self.speech.say("I did not recognize that command, sir. Please try again.")
+            self.speech.say("Sorry, I didn't catch that command. Please repeat.")
         return "unknown"
 
     # -- built-in handlers -------------------------------------------------

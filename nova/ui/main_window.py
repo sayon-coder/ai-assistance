@@ -343,7 +343,7 @@ class MainWindow(QWidget):
         page, layout = self._page()
         layout.addWidget(Heading(
             "Voice Settings",
-            "Wake word, microphone and Windows speech. All recognition and speech happen on this PC.",
+            "Continuous listening, microphone and Windows speech. All recognition and speech happen on this PC.",
         ))
 
         output = Card("Spoken output", "Windows SAPI voices. No cloud text-to-speech is used.")
@@ -454,18 +454,25 @@ class MainWindow(QWidget):
         diagnostics.add(QLabel("Listening state"))
         diagnostics.add(self.diag_wake)
         self.diag_heard = QLabel("Nothing recognised yet.")
+        self.diag_match = QLabel("No command matched yet.")
         self.diag_command = QLabel("No command executed yet.")
         self.diag_result = QLabel("No result yet.")
+        self.diag_failure = QLabel("No recognition failures.")
         self.diag_error = QLabel("No microphone or recognition errors.")
-        for label in (self.diag_heard, self.diag_command, self.diag_result, self.diag_error):
+        for label in (self.diag_heard, self.diag_match, self.diag_command,
+                      self.diag_result, self.diag_failure, self.diag_error):
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         diagnostics.add(QLabel("Last recognised sentence"))
         diagnostics.add(self.diag_heard)
+        diagnostics.add(QLabel("Last matched command"))
+        diagnostics.add(self.diag_match)
         diagnostics.add(QLabel("Last executed command"))
         diagnostics.add(self.diag_command)
         diagnostics.add(QLabel("Last command result"))
         diagnostics.add(self.diag_result)
+        diagnostics.add(QLabel("Last recognition failure"))
+        diagnostics.add(self.diag_failure)
         diagnostics.add(QLabel("Microphone and recognition errors"))
         diagnostics.add(self.diag_error)
         diag_actions = QHBoxLayout()
@@ -792,6 +799,7 @@ class MainWindow(QWidget):
         s = self.runtime.settings
         self.speech_switch.set_checked_silently(bool(s.get("voice_enabled", True)))
         self.wake_switch.set_checked_silently(bool(s.get("wake_enabled", True)))
+        self.always_switch.set_checked_silently(bool(s.get("always_listen", True)))
         self.opencode_switch.set_checked_silently(bool(s.get("opencode_enabled", True)))
         self.codex_switch.set_checked_silently(bool(s.get("codex_enabled", True)))
         self.interrupt_switch.set_checked_silently(bool(s.get("announce_interruptions", False)))
@@ -882,15 +890,19 @@ class MainWindow(QWidget):
         self.last_event.setText(self._status.get("last_event", "NOVA is ready."))
 
         heard = str(self._status.get("last_heard", "") or "").strip()
+        matched = str(self._status.get("last_match", "") or "").strip()
         command = str(self._status.get("last_command", "") or "").strip()
         result = str(self._status.get("last_result", "") or "").strip()
+        failure = str(self._status.get("last_failure", "") or "").strip()
         error = str(self._status.get("mic_error", "") or "").strip()
         self.last_heard_label.setText(heard or "Nothing recognised yet.")
         self.last_command_label.setText(command or "No command executed yet.")
         self.last_result_label.setText(result or "No result yet.")
         self.diag_heard.setText(heard or "Nothing recognised yet.")
+        self.diag_match.setText(matched or "No command matched yet.")
         self.diag_command.setText(command or "No command executed yet.")
         self.diag_result.setText(result or "No result yet.")
+        self.diag_failure.setText(failure or "No recognition failures.")
         self.diag_error.setText(error or "No microphone or recognition errors.")
         activity = self._status.get("recent_activity") or []
         self.activity_label.setText("\n".join(str(item) for item in activity) or "No activity yet.")

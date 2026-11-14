@@ -62,6 +62,12 @@ class StubRuntime(QObject):
         self.calls.append(("toggle_automation", entry_id, enabled))
         return True
 
+    def reserved_command_phrases(self):
+        return {"study mode", "open settings", "nova"}
+
+    def test_phrase(self, text):
+        return {"matched": False, "phrase": str(text), "reason": "stub runtime"}
+
     def status_snapshot(self):
         return dict(self.status)
 

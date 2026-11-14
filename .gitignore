@@ -5,6 +5,7 @@ logs/*.log
 models/*
 !models/README.txt
 config/settings.json
+config/custom_commands.json
 .pytest_cache/
 dist/
 build/

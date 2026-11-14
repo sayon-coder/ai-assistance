@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject
 
 from . import startup
 from .bridge import UiBridge
-from .commands import CommandRouter
+from .commands import CommandRouter, normalize_phrase
 from .config import (
     ROOT, load_modes, load_settings, save_modes as persist_modes,
     save_settings as persist_settings,
@@ -66,8 +66,10 @@ class NovaRuntime(QObject):
             "codex": "Codex starting…",
             "active_mode": "normal",
             "last_heard": "",
+            "last_match": "",
             "last_command": "",
             "last_result": "No command yet.",
+            "last_failure": "",
             "mic_error": "",
             "recent_activity": [],
             "last_event": "NOVA is ready, sir.",
@@ -183,6 +185,8 @@ class NovaRuntime(QObject):
         self.voice = VoiceController(
             self.settings, self.commands, self._voice_status, self._set_face,
             event_callback=self._voice_event,
+            grammar_provider=self.recognition_phrases,
+            phrase_timeout=self.settings.get("phrase_timeout"),
         )
         self.voice.start()
 
@@ -205,11 +209,15 @@ class NovaRuntime(QObject):
     def _voice_event(self, kind: str, text: str) -> None:
         if kind == "last_heard":
             self._set_status("last_heard", text)
+        elif kind == "last_match":
+            self._set_status("last_match", text)
         elif kind == "last_command":
             self._set_status("last_command", text)
         elif kind == "last_result":
             self._set_status("last_result", text)
             self._record_activity(text)
+        elif kind == "last_failure":
+            self._set_status("last_failure", text)
         elif kind == "mic_error":
             self._set_status("mic_error", text)
 
@@ -319,7 +327,7 @@ class NovaRuntime(QObject):
             log.exception("Could not persist wake setting")
         self._start_voice()
         self.bridge.settings_changed.emit(dict(self.settings))
-        self._notify("NOVA listening", "Wake word enabled." if enabled else "Wake word disabled.")
+        self._notify("NOVA listening", "Listening enabled." if enabled else "Listening disabled.")
 
     def listen_now(self) -> None:
         if not model_is_ready(resolve_model(self.settings.get("vosk_model_path"))):
@@ -329,6 +337,8 @@ class NovaRuntime(QObject):
             self.voice = VoiceController(
                 self.settings, self.commands, self._voice_status, self._set_face,
                 event_callback=self._voice_event,
+                grammar_provider=self.recognition_phrases,
+                phrase_timeout=self.settings.get("phrase_timeout"),
             )
             # When the wake word is disabled, capture exactly one command and
             # then release the microphone again instead of starting the wake loop.
@@ -440,6 +450,57 @@ class NovaRuntime(QObject):
         return cleaned
 
     # -- custom commands and automations ----------------------------------
+    def recognition_phrases(self) -> set[str]:
+        """All enabled phrases for the Vosk grammar (built-ins + custom)."""
+        phrases = set(self.commands.recognition_phrases())
+        try:
+            data = self.custom.snapshot()
+        except Exception:
+            log.exception("Could not read custom commands for the grammar")
+            return phrases
+        for kind in ("commands", "automations"):
+            for entry in data.get(kind, []):
+                if entry.get("enabled", True):
+                    phrases.update(entry.get("triggers", []))
+        return phrases
+
+    def _refresh_grammar(self) -> None:
+        """Apply a new command vocabulary without reloading the model."""
+        if self.voice is not None:
+            try:
+                self.voice.refresh_grammar()
+            except Exception:
+                log.exception("Could not refresh the recognition grammar")
+
+    def test_phrase(self, text: str) -> dict:
+        """Report what a typed phrase would match, without executing it."""
+        normalized = normalize_phrase(text)
+        if not normalized:
+            return {"matched": False, "phrase": "", "reason": "Type a phrase to test."}
+        command = self.commands.registry.match(normalized)
+        if command is not None:
+            return {
+                "matched": True,
+                "kind": "builtin",
+                "phrase": normalized,
+                "name": command.action,
+                "action": command.action,
+            }
+        entry = self.custom.match(normalized)
+        if entry is not None:
+            return {
+                "matched": True,
+                "kind": entry.get("kind", "command"),
+                "phrase": normalized,
+                "name": entry.get("name", "Custom command"),
+                "action": entry.get("action", "automation"),
+            }
+        return {
+            "matched": False,
+            "phrase": normalized,
+            "reason": "No enabled built-in, custom command or automation uses this phrase.",
+        }
+
     def handle_custom_phrase(self, text: str) -> str | None:
         entry = self.custom.match(text)
         if not entry:
@@ -479,31 +540,37 @@ class NovaRuntime(QObject):
 
     def save_custom_command(self, entry: dict, entry_id: str | None = None) -> dict:
         saved = self.custom.save_command(entry, entry_id)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return saved
 
     def delete_custom_command(self, entry_id: str) -> bool:
         removed = self.custom.delete("commands", entry_id)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return removed
 
     def set_custom_command_enabled(self, entry_id: str, enabled: bool) -> bool:
         changed = self.custom.set_enabled("commands", entry_id, enabled)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return changed
 
     def save_automation(self, entry: dict, entry_id: str | None = None) -> dict:
         saved = self.custom.save_automation(entry, entry_id)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return saved
 
     def delete_automation(self, entry_id: str) -> bool:
         removed = self.custom.delete("automations", entry_id)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return removed
 
     def set_automation_enabled(self, entry_id: str, enabled: bool) -> bool:
         changed = self.custom.set_enabled("automations", entry_id, enabled)
+        self._refresh_grammar()
         self.bridge.settings_changed.emit(dict(self.settings))
         return changed
 

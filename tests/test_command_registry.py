@@ -145,7 +145,7 @@ def test_unknown_command_does_not_execute_anything():
     router, speech, _modes, app = build()
     assert router.handle("make me a sandwich") == "unknown"
     assert app.events == []
-    assert "not recognize" in speech.spoken[-1]
+    assert "didn't catch" in speech.spoken[-1]
 
 
 def test_unknown_can_be_silent_for_the_voice_layer():
@@ -168,6 +168,14 @@ def test_custom_handler_runs_only_after_builtins():
     assert calls == []
     assert router.handle("open my notes") == "custom:1"
     assert calls == ["open my notes"]
+
+
+def test_unmute_spoken_forms_are_exact_aliases():
+    router, _speech, _modes, app = build()
+    assert router.handle("unmute") == "unmute"
+    assert router.handle("un mute") == "unmute"
+    assert router.handle("un mute voice") == "unmute"
+    assert app.events == [("mute", False)] * 3
 
 
 def test_registry_rejects_duplicate_phrases():

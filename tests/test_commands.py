@@ -102,7 +102,7 @@ def test_unknown_command_is_reported_not_crashing():
     router, speech, app = build()
     assert router.handle("make me a sandwich") == "unknown"
     assert app.events == []
-    assert speech.spoken and "not recognize" in speech.spoken[-1]
+    assert speech.spoken and "didn't catch" in speech.spoken[-1]
 
 
 def test_time_and_help():

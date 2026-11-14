@@ -66,6 +66,7 @@ DEFAULT_SETTINGS: dict = {
     # Voice input
     "wake_enabled": True,
     "always_listen": True,
+    "phrase_timeout": 4.0,
     "vosk_model_path": "models/vosk-model-small-en-us-0.15",
     "microphone_device": None,
     # Voice output
@@ -183,11 +184,15 @@ def normalize_settings(raw: dict) -> dict:
         except (TypeError, ValueError):
             merged["microphone_device"] = None
     for key in (
-        "wake_enabled", "voice_enabled", "show_face", "opencode_enabled",
-        "codex_enabled", "announce_interruptions", "start_with_windows",
-        "setup_complete",
+        "wake_enabled", "always_listen", "voice_enabled", "show_face",
+        "opencode_enabled", "codex_enabled", "announce_interruptions",
+        "start_with_windows", "setup_complete",
     ):
         merged[key] = bool(merged.get(key))
+    try:
+        merged["phrase_timeout"] = max(2.0, min(8.0, float(merged.get("phrase_timeout", 4.0))))
+    except (TypeError, ValueError):
+        merged["phrase_timeout"] = 4.0
     merged["opencode_base_url"] = str(merged.get("opencode_base_url") or "").strip()
     return merged
 
