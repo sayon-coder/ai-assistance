@@ -1,4 +1,4 @@
-"""Editable Study / Entertainment mode configuration without JSON."""
+"""Editable Study / Entertainment / Stock mode configuration without JSON."""
 from __future__ import annotations
 
 from pathlib import Path

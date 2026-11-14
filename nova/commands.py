@@ -212,6 +212,18 @@ def build_builtin_registry() -> CommandRegistry:
         "Activate Entertainment Mode.",
     )
     registry.register(
+        "stock",
+        (
+            "stock mode", "stock", "stock market", "stock market mode",
+            "market mode", "open news", "open the news", "open stock market",
+            "open stock mode", "show me the news", "business news",
+            "open business news", "news mode", "news", "activate stock mode",
+            "start stock mode", "switch to stock mode", "get ready for stock",
+            "prepare stock mode",
+        ),
+        "Activate Stock Mode.",
+    )
+    registry.register(
         "mute",
         ("mute", "mute voice", "mute yourself", "be quiet", "silence", "stop speaking",
          "disable voice", "turn off voice", "stop voice"),
@@ -368,6 +380,10 @@ class CommandRouter:
         self.app.activate_mode("entertainment")
         return "entertainment"
 
+    def _do_stock(self) -> str:
+        self.app.activate_mode("stock")
+        return "stock"
+
     def _do_mute(self) -> str:
         self.app.set_muted(True)
         return "mute"
@@ -420,7 +436,7 @@ class CommandRouter:
 
     def _do_help(self) -> str:
         self.speech.say(
-            "I can activate your study or entertainment mode, mute or unmute my voice, "
+            "I can activate your study, entertainment or stock mode, mute or unmute my voice, "
             "open my settings, hide or show my face, stop or start listening, run your "
             "custom commands and automations, and tell you the time, sir."
         )

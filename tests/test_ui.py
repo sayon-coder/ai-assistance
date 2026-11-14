@@ -146,10 +146,10 @@ def test_window_has_all_required_sections(qapp):
     runtime, face, window = make_window(qapp)
     try:
         assert [key for key, _ in PAGES] == [
-            "dashboard", "study", "entertainment", "voice", "commands",
+            "dashboard", "study", "entertainment", "stock", "voice", "commands",
             "appearance", "monitoring", "startup", "about",
         ]
-        assert window.stack.count() == 9
+        assert window.stack.count() == 10
         assert set(window.nav_buttons) == {key for key, _ in PAGES}
         window.show_page("voice")
         assert window.stack.currentWidget() is window.pages["voice"]

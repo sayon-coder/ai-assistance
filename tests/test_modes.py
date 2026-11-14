@@ -73,3 +73,20 @@ def test_unknown_mode_is_handled():
     m, speech, _urls, _launched = manager({"greeting": "x", "urls": [], "apps": []})
     assert m.activate("cinema") is False
     assert "could not find" in speech.spoken[-1].lower()
+
+
+def test_default_stock_mode_opens_the_two_market_sites():
+    from nova.config import DEFAULT_MODES
+
+    speech = FakeSpeech()
+    opened = []
+    m = ModeManager(
+        {"stock": DEFAULT_MODES["stock"]}, speech,
+        url_opener=lambda url: opened.append(url),
+    )
+    assert m.activate("stock") is True
+    assert opened == [
+        "https://www.moneycontrol.com/",
+        "https://economictimes.indiatimes.com/markets",
+    ]
+    assert m.current_mode == "stock"

@@ -102,6 +102,9 @@ class NovaApplication(QObject):
         entertain = QAction("Activate Entertainment Mode", self)
         entertain.triggered.connect(lambda: self.runtime.activate_mode("entertainment"))
         self.tray_menu.addAction(entertain)
+        stock = QAction("Activate Stock Mode", self)
+        stock.triggered.connect(lambda: self.runtime.activate_mode("stock"))
+        self.tray_menu.addAction(stock)
 
         self.tray_menu.addSeparator()
         self.startup_action = QAction("Start with Windows", self)

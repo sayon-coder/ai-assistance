@@ -33,6 +33,7 @@ PAGES = [
     ("dashboard", "Dashboard"),
     ("study", "Study Mode"),
     ("entertainment", "Entertainment Mode"),
+    ("stock", "Stock Mode"),
     ("voice", "Voice Settings"),
     ("commands", "Custom Commands & Automations"),
     ("appearance", "Appearance"),
@@ -119,6 +120,10 @@ class MainWindow(QWidget):
             "entertainment": self._page_mode(
                 "entertainment", "Entertainment Mode",
                 "Everything opened by “NOVA, get ready for my entertainment mode”.",
+            ),
+            "stock": self._page_mode(
+                "stock", "Stock Mode",
+                "Everything opened by “NOVA, open news” or “NOVA, stock mode”.",
             ),
             "voice": self._page_voice(),
             "commands": self._page_commands(),
@@ -264,11 +269,14 @@ class MainWindow(QWidget):
         study.clicked.connect(lambda: self.runtime.activate_mode("study"))
         entertain = QPushButton("Entertainment Mode")
         entertain.clicked.connect(lambda: self.runtime.activate_mode("entertainment"))
+        stock = QPushButton("Stock Mode")
+        stock.clicked.connect(lambda: self.runtime.activate_mode("stock"))
         listen = QPushButton("Listen now")
         listen.setToolTip("Capture one spoken command without saying the wake word.")
         listen.clicked.connect(self.runtime.listen_now)
         first.addWidget(study)
         first.addWidget(entertain)
+        first.addWidget(stock)
         first.addWidget(listen)
         first.addStretch(1)
         actions.add_layout(first)
@@ -713,7 +721,7 @@ class MainWindow(QWidget):
         about = Card("What NOVA is")
         about.add(muted(
             "A lightweight desktop companion with an animated face, nine-section control center, "
-            "editable study and entertainment modes, fully offline wake-word and command recognition, "
+            "editable study, entertainment and stock modes, fully offline wake-word and command recognition, "
             "Windows SAPI speech, and honest local monitoring for OpenCode and Codex Desktop."
         ))
         layout.addWidget(about)

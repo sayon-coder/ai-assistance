@@ -25,14 +25,14 @@ log = logging.getLogger("nova.custom")
 
 COMMAND_ACTIONS = ("open_app", "open_url", "activate_mode", "wait")
 STEP_ACTIONS = ("open_app", "close_app", "open_url", "activate_mode", "wait")
-MODE_NAMES = ("study", "entertainment")
+MODE_NAMES = ("study", "entertainment", "stock")
 SUPPORTED_APP_SUFFIXES = {".exe", ".lnk", ".url", ".bat", ".cmd"}
 
 ACTION_LABELS = {
     "open_app": "Open an application",
     "close_app": "Close an application NOVA started",
     "open_url": "Open a website",
-    "activate_mode": "Activate Study or Entertainment mode",
+    "activate_mode": "Activate Study, Entertainment or Stock mode",
     "wait": "Wait for a delay",
 }
 
@@ -111,7 +111,7 @@ def validate_command(entry: dict, reserved=(), used=(), existing_id: str | None 
     elif action == "activate_mode":
         mode = str(params.get("mode", "")).strip().lower()
         if mode not in MODE_NAMES:
-            raise ValueError("Choose Study or Entertainment mode.")
+            raise ValueError("Choose Study, Entertainment or Stock mode.")
         clean_params = {"mode": mode}
     elif action == "wait":
         clean_params = {"seconds": _clamp_wait(params.get("seconds", 1.0))}
@@ -150,7 +150,7 @@ def validate_step(step: dict) -> dict:
     elif action == "activate_mode":
         mode = str(params.get("mode", "")).strip().lower()
         if mode not in MODE_NAMES:
-            raise ValueError("Choose Study or Entertainment mode.")
+            raise ValueError("Choose Study, Entertainment or Stock mode.")
         clean_params = {"mode": mode}
     elif action == "wait":
         clean_params = {"seconds": _clamp_wait(params.get("seconds", 1.0))}

@@ -316,6 +316,7 @@ class FaceWidget(QWidget):
         menu.addSeparator()
         study_action = menu.addAction("Activate Study Mode")
         entertain_action = menu.addAction("Activate Entertainment Mode")
+        stock_action = menu.addAction("Activate Stock Mode")
         menu.addSeparator()
         tray_action = menu.addAction("Hide control center to tray")
         exit_action = menu.addAction("Exit NOVA completely")
@@ -332,6 +333,8 @@ class FaceWidget(QWidget):
             self.runtime.activate_mode("study")
         elif chosen == entertain_action:
             self.runtime.activate_mode("entertainment")
+        elif chosen == stock_action:
+            self.runtime.activate_mode("stock")
         elif chosen == tray_action:
             self.runtime.bridge.hide_to_tray.emit()
         elif chosen == exit_action:

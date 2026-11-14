@@ -101,6 +101,19 @@ def test_entertainment_variations_are_all_exact_aliases():
     assert app.events == [("mode", "entertainment")] * 4
 
 
+def test_stock_mode_aliases_include_open_news():
+    router, _speech, _modes, app = build()
+    for phrase in (
+        "stock mode",
+        "open news",
+        "stock market mode",
+        "business news",
+        "news",
+    ):
+        assert router.handle(phrase) == "stock"
+    assert app.events == [("mode", "stock")] * 5
+
+
 def test_token_boundaries_prevent_substring_matches():
     router, _speech, _modes, app = build()
     assert router.handle("commute") == "unknown"

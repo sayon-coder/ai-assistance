@@ -112,7 +112,7 @@ def test_face_overlay_keeps_transparency(qapp):
 
 def test_navigation_contains_custom_commands_section(qapp):
     assert [key for key, _ in PAGES] == [
-        "dashboard", "study", "entertainment", "voice", "commands",
+        "dashboard", "study", "entertainment", "stock", "voice", "commands",
         "appearance", "monitoring", "startup", "about",
     ]
     runtime, face, window = make_window(qapp)

@@ -1,4 +1,4 @@
-"""Study and Entertainment modes: editable lists of websites and applications."""
+"""Study, Entertainment and Stock modes: editable lists of websites and applications."""
 from __future__ import annotations
 
 import logging

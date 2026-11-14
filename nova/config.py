@@ -105,6 +105,14 @@ DEFAULT_MODES: dict = {
         ],
         "apps": [],
     },
+    "stock": {
+        "greeting": "Certainly, sir. Your stock market environment is ready.",
+        "urls": [
+            "https://www.moneycontrol.com/",
+            "https://economictimes.indiatimes.com/markets",
+        ],
+        "apps": [],
+    },
 }
 
 _LEGACY_KEYS = ("porcupine_access_key", "porcupine_keyword_path")

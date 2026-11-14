@@ -65,7 +65,7 @@ def test_wait_is_bounded_and_unknown_mode_rejected():
     clean = validate_command({"name": "pause", "triggers": ["pause"],
                               "action": "wait", "params": {"seconds": 999}}, RESERVED)
     assert clean["params"]["seconds"] == 30.0
-    with pytest.raises(ValueError, match="Study or Entertainment"):
+    with pytest.raises(ValueError, match="Study, Entertainment or Stock"):
         validate_command({"name": "mode", "triggers": ["switch"],
                           "action": "activate_mode", "params": {"mode": "cinema"}},
                          RESERVED)
