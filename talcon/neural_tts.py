@@ -1,0 +1,527 @@
+"""Offline neural text-to-speech through Kokoro-82M (ONNX).
+
+Hardware decision
+-----------------
+TALCON targets a Ryzen 5 3550H with 16 GB RAM, a GTX 1650 (4 GB) and no CUDA
+toolkit.  Measured on that machine, the quantised Kokoro int8 model loads in
+about 1.3 s and synthesises speech at roughly 1.2× the length of the audio on
+the CPU.  That is not fast enough to run permanently, but it is perfectly
+usable for the short, Jarvis-style sentences TALCON speaks when the model is
+loaded lazily and released after a quiet period.
+
+DirectML (the GPU path) rejects this model's ``ConvTranspose`` node, so the CPU
+provider is used deliberately.  Everything stays local: no API key, no cloud
+service and no account.
+
+Kokoro is the only speech engine TALCON uses.  If the model files or the
+``kokoro-onnx`` package are missing, :func:`available` returns ``False`` and
+:func:`unavailable_reason` explains what to install; there is no robotic
+Windows fallback.
+"""
+from __future__ import annotations
+
+import io
+import logging
+import os
+import queue
+import re
+import threading
+import time
+import wave
+from pathlib import Path
+
+import numpy as np
+
+from .config import MODELS_DIR
+
+log = logging.getLogger("talcon.neural_tts")
+
+#: Folder containing ``kokoro-v1.0.int8.onnx`` and ``voices-v1.0.bin``.
+KOKORO_DIR = MODELS_DIR / "kokoro"
+KOKORO_MODEL_NAMES = ("kokoro-v1.0.int8.onnx", "kokoro-v1.0.onnx")
+KOKORO_VOICES_NAME = "voices-v1.0.bin"
+
+#: Kokoro-82M is licensed Apache-2.0; the files come from the publisher.
+KOKORO_LICENSE = "Apache License 2.0"
+KOKORO_HOMEPAGE = "https://github.com/thewh1teagle/kokoro-onnx"
+KOKORO_SIZE_MB = 118
+
+#: Default voice: a calm British male, closest to a butler-style assistant.
+DEFAULT_VOICE = "bm_george"
+DEFAULT_LANGUAGE = "en-gb"
+
+#: Voices offered in the settings list, with a friendly label.  Every other
+#: voice in the model file is still selectable by id.
+KNOWN_VOICES = (
+    ("bm_george", "George · British male"),
+    ("bm_lewis", "Lewis · British male"),
+    ("bm_fable", "Fable · British male"),
+    ("am_michael", "Michael · American male"),
+    ("am_fenrir", "Fenrir · American male"),
+    ("am_puck", "Puck · American male"),
+    ("af_heart", "Heart · American female"),
+    ("af_bella", "Bella · American female"),
+    ("bf_emma", "Emma · British female"),
+    ("bf_isabella", "Isabella · British female"),
+)
+
+#: Release the model after this long without speech.  A reload costs about
+#: 2.4 s on the target laptop, so keep it warm for a few minutes; short idle
+#: gaps between follow-up questions should not be paid for twice.
+IDLE_UNLOAD_SECONDS = 300.0
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+#: Long sentences are split at clauses.  Smaller chunks let the first words
+#: start playing sooner; the pipelined synthesiser hides most of the rest.
+_MAX_CHUNK = 200
+
+
+def model_paths() -> tuple[Path | None, Path]:
+    """Return ``(model, voices)`` paths, choosing the smallest available model."""
+    voices = KOKORO_DIR / KOKORO_VOICES_NAME
+    for name in KOKORO_MODEL_NAMES:
+        candidate = KOKORO_DIR / name
+        if candidate.is_file():
+            return candidate, voices
+    return None, voices
+
+
+def package_available() -> bool:
+    """True when the optional Python packages can be imported."""
+    try:
+        import kokoro_onnx  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def model_ready() -> bool:
+    model, voices = model_paths()
+    return bool(model and model.is_file() and voices.is_file())
+
+
+def available() -> bool:
+    """True when Kokoro can actually be used on this PC right now."""
+    return package_available() and model_ready()
+
+
+def unavailable_reason() -> str:
+    """A short, honest explanation for the settings page."""
+    if not model_ready():
+        model, voices = model_paths()
+        missing = []
+        if model is None:
+            missing.append("kokoro-v1.0.int8.onnx")
+        if not voices.is_file():
+            missing.append(KOKORO_VOICES_NAME)
+        return (
+            "Kokoro voice model not installed ("
+            + ", ".join(missing)
+            + "). Place it in models/kokoro or run "
+            "`python -m talcon.model_setup --kokoro`."
+        )
+    if not package_available():
+        return (
+            "The optional kokoro-onnx package is not installed. Run "
+            "`pip install kokoro-onnx onnxruntime`."
+        )
+    return ""
+
+
+def _split_long(sentence: str, limit: int) -> list[str]:
+    """Break one over-long sentence at a clause boundary."""
+    pieces: list[str] = []
+    sentence = sentence.strip()
+    while len(sentence) > limit:
+        window = sentence[:limit]
+        cut = max(
+            window.rfind(", "),
+            window.rfind("; "),
+            window.rfind(": "),
+            window.rfind(" "),
+        )
+        if cut < limit // 2:
+            cut = limit
+        piece = sentence[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        sentence = sentence[cut:].strip()
+    if sentence:
+        pieces.append(sentence)
+    return pieces or [""]
+
+
+def split_for_speech(text: str, limit: int = _MAX_CHUNK) -> list[str]:
+    """Split text into short, sentence-sized chunks for low-latency playback.
+
+    One sentence per chunk means the first words can be synthesised and played
+    while later sentences are still being generated.  Only unusually long
+    sentences are split further, at a comma or clause boundary when possible.
+    """
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return []
+    sentences = [part.strip() for part in _SENTENCE_SPLIT.split(raw) if part.strip()]
+    chunks: list[str] = []
+    for index, sentence in enumerate(sentences):
+        # Keep the first chunk short so speech starts sooner.
+        chunks.extend(_split_long(sentence, 90 if index == 0 else limit))
+    return [chunk for chunk in chunks if chunk]
+
+
+def voice_label(voice_id: str) -> str:
+    """A friendly name; the engine is already shown as an engine label."""
+    for key, label in KNOWN_VOICES:
+        if key == voice_id:
+            return label
+    return str(voice_id or "").replace("_", " ").strip().title()
+
+
+def wav_bytes(samples, sample_rate: int, volume: float = 1.0) -> bytes:
+    """Convert float samples to PCM WAV bytes, applying volume safely."""
+    audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+    gain = max(0.0, min(1.0, float(volume)))
+    if gain < 0.999:
+        audio = audio * gain
+    pcm = np.clip(audio, -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype(np.int16)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(int(sample_rate))
+        handle.writeframes(pcm.tobytes())
+    return buffer.getvalue()
+
+
+def _inference_threads() -> int:
+    """Pick a CPU thread count that is fast without starving the UI/mic.
+
+    The target laptop has a 4-core/8-thread Ryzen 5.  Letting ONNX Runtime use
+    all logical cores was measurably slower than four threads, and it also
+    competed with the microphone and UI threads.
+    """
+    logical = os.cpu_count() or 4
+    return max(2, min(6, logical // 2))
+
+
+def _load_engine(model: Path, voices: Path):
+    """Build a tuned CPU ONNX session, falling back to the stock constructor."""
+    from kokoro_onnx import Kokoro
+
+    try:
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = _inference_threads()
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session = ort.InferenceSession(
+            str(model), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        log.info(
+            "Kokoro ONNX session ready (%d intra-op threads)",
+            options.intra_op_num_threads,
+        )
+        return Kokoro.from_session(session, str(voices))
+    except Exception:
+        log.debug("Tuned Kokoro session failed; using the default", exc_info=True)
+        return Kokoro(str(model), str(voices))
+
+
+class KokoroBackend:
+    """Lazily loaded Kokoro synthesiser with a persistent-host-like interface."""
+
+    backend_kind = "kokoro"
+    reader_name = "TALCON-Kokoro"
+
+    def __init__(self, on_error=None):
+        self.on_error = on_error or (lambda message: None)
+        self._lock = threading.RLock()
+        self._engine = None
+        self._last_error = ""
+        self._voice = DEFAULT_VOICE
+        self._language = DEFAULT_LANGUAGE
+        self._rate = 0
+        self._volume = 90
+        self._stopped = threading.Event()
+        self._unload_timer: threading.Timer | None = None
+        self._used: dict = {}
+        self._last_spoken = ""
+        self._voice_ids: list[str] = []
+
+    # -- lifecycle ---------------------------------------------------------
+    def ensure_started(self, timeout: float = 25.0) -> bool:
+        """Load the model once.  Returns False with a spoken-friendly reason."""
+        with self._lock:
+            if self._engine is not None:
+                return True
+            if not available():
+                self._last_error = unavailable_reason()
+                self.on_error(self._last_error)
+                return False
+            model, voices = model_paths()
+            if model is None:
+                self._last_error = unavailable_reason()
+                self.on_error(self._last_error)
+                return False
+            try:
+                log.info("Loading the Kokoro neural voice model (int8, CPU)")
+                engine = _load_engine(model, voices)
+            except Exception as exc:
+                log.exception("Could not load the Kokoro model")
+                self._last_error = f"Kokoro could not start: {exc}"
+                self.on_error(self._last_error)
+                return False
+            self._engine = engine
+            try:
+                names = list(engine.get_voices())
+            except Exception:
+                names = []
+            self._voice_ids = names
+            if self._voice and names and self._voice not in names:
+                self._voice = DEFAULT_VOICE if DEFAULT_VOICE in names else names[0]
+            self._schedule_unload()
+            return True
+
+    def _schedule_unload(self) -> None:
+        timer = self._unload_timer
+        if timer is not None:
+            timer.cancel()
+        timer = threading.Timer(IDLE_UNLOAD_SECONDS, self._unload_if_idle)
+        timer.daemon = True
+        self._unload_timer = timer
+        timer.start()
+
+    def _unload_if_idle(self) -> None:
+        with self._lock:
+            self._engine = None
+            self._voice_ids = []
+            self._unload_timer = None
+        log.info("Kokoro released after %.0f s idle", IDLE_UNLOAD_SECONDS)
+
+    def stop(self) -> None:
+        timer = self._unload_timer
+        self._unload_timer = None
+        if timer is not None:
+            timer.cancel()
+        self._stopped.set()
+        self.stop_speaking()
+        with self._lock:
+            self._engine = None
+            self._voice_ids = []
+
+    def stop_speaking(self) -> None:
+        """Interrupt playback immediately (the model stays loaded)."""
+        self._stopped.set()
+        self._purge_audio()
+
+    @staticmethod
+    def _purge_audio() -> None:
+        try:
+            import winsound
+
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+    # -- settings ----------------------------------------------------------
+    def set_rate(self, rate: int) -> None:
+        self._rate = max(-10, min(10, int(rate)))
+
+    def set_volume(self, volume: int) -> None:
+        self._volume = max(0, min(100, int(volume)))
+
+    def request_voice(self, name: str) -> bool:
+        candidate = str(name or "").strip()
+        if not candidate:
+            return False
+        with self._lock:
+            if self._voice_ids and candidate not in self._voice_ids:
+                # A friendly label may have been stored instead of the id.
+                for key, label in KNOWN_VOICES:
+                    if candidate == label:
+                        candidate = key
+                        break
+            if self._voice_ids and candidate not in self._voice_ids:
+                self._last_error = f"Voice is not installed: {candidate}"
+                return False
+            self._voice = candidate
+            self._language = "en-gb" if candidate.startswith("b") else "en-us"
+        return True
+
+    def set_voice(self, name: str, wait: bool = True) -> bool:
+        ok = self.request_voice(name)
+        if not ok:
+            self.on_error(self._last_error)
+        return ok
+
+    def wait_voice(self, timeout: float = 3.0) -> tuple[bool, str, str]:
+        return True, self._voice, ""
+
+    def voice_details(self, timeout: float = 15.0) -> list:
+        from .speech import ENGINE_KOKORO, VoiceInfo
+
+        ids = list(self._voice_ids)
+        if not ids:
+            # Even before the model loads, offer the known voices so the
+            # settings page is not empty.
+            ids = [key for key, _label in KNOWN_VOICES]
+        # Put the curated, butler-like voices first, then every remaining id.
+        known = [key for key, _label in KNOWN_VOICES]
+        ids = [voice_id for voice_id in known if voice_id in ids] + [
+            voice_id for voice_id in ids if voice_id not in known
+        ]
+        details = []
+        for voice_id in ids:
+            details.append(
+                VoiceInfo(
+                    id=voice_id,
+                    name=voice_label(voice_id),
+                    engine=ENGINE_KOKORO,
+                    language="en-GB" if voice_id.startswith("b") else "en-US",
+                    gender="Male" if voice_id.startswith(("am", "bm")) else "Female",
+                    description="Kokoro-82M offline neural voice",
+                    backend="kokoro",
+                    voice_type="Neural",
+                    source="kokoro",
+                    ssml=False,
+                )
+            )
+        return details
+
+    def voices(self, timeout: float = 15.0) -> list[str]:
+        return [voice.name for voice in self.voice_details(timeout)]
+
+    def has_natural_voice(self, timeout: float = 10.0) -> bool:
+        return True
+
+    def state(self, timeout: float = 3.0) -> dict:
+        return {
+            "engine": "kokoro",
+            "voice": self._voice,
+            "loaded": self._engine is not None,
+        }
+
+    # -- synthesis ---------------------------------------------------------
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    @property
+    def last_synthesis(self) -> dict:
+        return dict(self._used or {})
+
+    supports_playback_start = True
+
+    def say(self, text: str, timeout: float | None = None,
+            on_start=None) -> bool:
+        self._stopped.clear()
+        self._schedule_unload()
+        if not self.ensure_started():
+            return False
+        with self._lock:
+            engine = self._engine
+        if engine is None:
+            self._last_error = "The Kokoro model was released; please try again."
+            return False
+        if self._stopped.is_set():
+            return True
+        chunks = split_for_speech(text)
+        if not chunks:
+            return True
+        return self._say_chunks(engine, chunks, text, timeout, on_start)
+
+    def _say_chunks(self, engine, chunks, text, timeout, on_start=None) -> bool:
+        """Synthesise ahead while the previous chunk is playing."""
+        started = time.monotonic()
+        speed = max(0.6, min(1.4, 1.0 + (self._rate * 0.04)))
+        ready: queue.Queue = queue.Queue()
+        state = {"error": ""}
+
+        def produce() -> None:
+            for index, chunk in enumerate(chunks):
+                if self._stopped.is_set():
+                    break
+                if timeout is not None and time.monotonic() - started > timeout:
+                    state["error"] = "Kokoro synthesis took too long."
+                    break
+                item = self._synthesise(engine, chunk, speed, index, len(chunks))
+                if item is None:
+                    break
+                ready.put(item)
+            ready.put(None)
+
+        producer = threading.Thread(
+            target=produce, name="TALCON-Kokoro-Synth", daemon=True
+        )
+        producer.start()
+        ok = self._play_ready(ready, state, text, on_start)
+        producer.join(timeout=1.0)
+        return ok
+
+    def _synthesise(self, engine, chunk, speed, index, total):
+        try:
+            samples, sample_rate = engine.create(
+                chunk, voice=self._voice, speed=speed, lang=self._language
+            )
+        except Exception as exc:
+            log.exception("Kokoro synthesis failed")
+            self._last_error = f"Kokoro synthesis failed: {exc}"
+            self.on_error(self._last_error)
+            return None
+        data = wav_bytes(samples, sample_rate, self._volume / 100.0)
+        seconds = len(samples) / float(sample_rate or 1)
+        return (index, data, seconds, total)
+
+    def _play_ready(self, ready, state, text, on_start=None) -> bool:
+        spoken = 0.0
+        announced = False
+        while True:
+            item = ready.get()
+            if item is None or self._stopped.is_set():
+                break
+            index, data, seconds, total = item
+            spoken += seconds
+            self._used = {
+                "mode": "kokoro",
+                "voice_id": self._voice,
+                "voice_name": self._voice,
+                "chunk": index + 1,
+                "chunks": total,
+                "audio_seconds": round(spoken, 2),
+            }
+            if not announced and callable(on_start):
+                announced = True
+                try:
+                    on_start()
+                except Exception:
+                    log.debug("Playback-start callback failed", exc_info=True)
+            if not self._play(data):
+                self._stopped.set()
+                break
+            self._schedule_unload()
+        if state["error"]:
+            self._last_error = state["error"]
+            self.on_error(self._last_error)
+            return False
+        if not self._stopped.is_set():
+            self._last_spoken = str(text)
+        return True
+
+    def _play(self, data: bytes) -> bool:
+        try:
+            import winsound
+
+            winsound.PlaySound(data, winsound.SND_MEMORY)
+            return True
+        except Exception as exc:
+            log.exception("Could not play the Kokoro audio")
+            self._last_error = f"Audio playback failed: {exc}"
+            self.on_error(self._last_error)
+            return False
+
+
+def create_backend(kind: str = "kokoro", on_error=None) -> KokoroBackend:
+    return KokoroBackend(on_error=on_error)

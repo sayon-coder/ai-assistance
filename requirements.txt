@@ -1,0 +1,10 @@
+# TALCON runtime dependencies — all free and open source, no paid SDKs.
+PySide6-Essentials>=6.9,<7
+numpy>=1.26
+vosk>=0.3.45
+sounddevice>=0.4.6
+requests>=2.31
+zstandard>=0.23
+# The free, offline Kokoro-82M neural voice — TALCON's only speech engine.
+kokoro-onnx>=0.4.7
+onnxruntime>=1.24

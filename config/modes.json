@@ -1,0 +1,38 @@
+{
+  "entertainment": {
+    "greeting": "Sure sir. Your entertainment environment is getting ready.",
+    "urls": [],
+    "apps": [
+      {
+        "kind": "shortcut",
+        "name": "YouTube",
+        "path": "C:\\Users\\USER\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Brave Apps\\YouTube.lnk",
+        "args": [],
+        "aumid": ""
+      }
+    ]
+  },
+  "stock": {
+    "greeting": "Sure sir. these are some websites you can refer for the markets situations and news.",
+    "urls": [
+      "https://www.moneycontrol.com/",
+      "https://economictimes.indiatimes.com/markets"
+    ],
+    "apps": []
+  },
+  "study": {
+    "greeting": "Sure sir, websites required for studying is getting ready.",
+    "urls": [
+      "https://indiabix.com"
+    ],
+    "apps": [
+      {
+        "kind": "shortcut",
+        "name": "YouTube",
+        "path": "C:\\Users\\USER\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Brave Apps\\YouTube.lnk",
+        "args": [],
+        "aumid": ""
+      }
+    ]
+  }
+}
