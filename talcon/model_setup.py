@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import tarfile
 import tempfile
 import urllib.request
 import zipfile
@@ -37,6 +38,16 @@ KOKORO_FILES = {
 }
 KOKORO_LICENSE = "Apache License 2.0"
 KOKORO_HOMEPAGE = "https://github.com/thewh1teagle/kokoro-onnx"
+
+# -- optional sherpa-onnx streaming transducer ------------------------------
+SHERPA_MODEL_NAME = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+SHERPA_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    f"{SHERPA_MODEL_NAME}.tar.bz2"
+)
+SHERPA_LICENSE = "Apache License 2.0"
+SHERPA_HOMEPAGE = "https://github.com/k2-fsa/sherpa-onnx"
+SHERPA_SIZE_MB = 250
 
 
 def model_is_ready(path: Path | str) -> bool:
@@ -161,22 +172,106 @@ def download_kokoro(progress: Progress | None = None,
     return target
 
 
+def sherpa_model_is_ready(path: Path | str) -> bool:
+    from .asr.sherpa_engine import model_ready
+
+    return model_ready(path)
+
+
+def download_sherpa(progress: Progress | None = None,
+                    target_root: Path | None = None) -> Path:
+    """Download the optional sherpa-onnx English streaming transducer."""
+    progress = progress or (lambda percent, text: None)
+    target_root = target_root or MODELS_DIR
+    target = target_root / SHERPA_MODEL_NAME
+    if sherpa_model_is_ready(target):
+        progress(100, "sherpa-onnx streaming model already installed.")
+        return target
+
+    target_root.mkdir(parents=True, exist_ok=True)
+    progress(0, f"Downloading the sherpa-onnx model ({SHERPA_SIZE_MB} MB)…")
+    request = urllib.request.Request(
+        SHERPA_URL, headers={"User-Agent": f"TALCON/{VERSION}"}
+    )
+    with tempfile.TemporaryDirectory(
+        dir=str(target_root), prefix=".talcon-sherpa-"
+    ) as temp_name:
+        temp = Path(temp_name)
+        archive_path = temp / f"{SHERPA_MODEL_NAME}.tar.bz2"
+        with urllib.request.urlopen(request, timeout=120) as response, archive_path.open("wb") as handle:
+            total = int(response.headers.get("Content-Length") or 0)
+            received = 0
+            while True:
+                chunk = response.read(512 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                received += len(chunk)
+                if total:
+                    progress(
+                        min(82, int(received * 82 / total)),
+                        f"Downloading… {received // (1024 * 1024)} of "
+                        f"{max(1, total // (1024 * 1024))} MB",
+                    )
+        progress(86, "Verifying and extracting the sherpa-onnx model…")
+        extract_dir = temp / "extract"
+        extract_dir.mkdir()
+        with tarfile.open(archive_path, "r:bz2") as archive:
+            try:
+                archive.extractall(extract_dir, filter="data")
+            except TypeError:  # Python older than 3.12 has no filter argument
+                archive.extractall(extract_dir)
+        source = extract_dir / SHERPA_MODEL_NAME
+        if not source.is_dir():
+            # Some releases nest the folder one level deeper.
+            candidates = [
+                item for item in extract_dir.iterdir()
+                if item.is_dir() and sherpa_model_is_ready(item)
+            ]
+            source = candidates[0] if candidates else source
+        if not sherpa_model_is_ready(source):
+            raise RuntimeError(
+                "The sherpa-onnx archive is missing its transducer files."
+            )
+        staging = target_root / f".{SHERPA_MODEL_NAME}.installing"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        shutil.move(str(source), str(staging))
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        staging.replace(target)
+
+    (target / "MODEL_LICENSE.txt").write_text(
+        f"{SHERPA_MODEL_NAME}\nLicence: {SHERPA_LICENSE}\n"
+        f"Source: {SHERPA_HOMEPAGE}\n\n"
+        "The model is downloaded from the publisher and used locally. "
+        "TALCON never uploads audio.\n",
+        encoding="utf-8",
+    )
+    progress(100, "sherpa-onnx streaming model installed.")
+    return target
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install offline speech models for TALCON")
     parser.add_argument("--target", default=None, help="models directory (default: project models/)")
     parser.add_argument("--kokoro", action="store_true",
                         help="install the Kokoro neural voice (the only speech engine) instead of Vosk")
+    parser.add_argument("--sherpa", action="store_true",
+                        help="install the optional sherpa-onnx streaming recognition model")
     args = parser.parse_args(argv)
 
     def report(percent: int, text: str) -> None:
         print(f"[{percent:3d}%] {text}", flush=True)
 
     try:
-        path = (
-            download_kokoro(report, Path(args.target) if args.target else None)
-            if args.kokoro
-            else download(report, Path(args.target) if args.target else None)
-        )
+        target = Path(args.target) if args.target else None
+        if args.kokoro:
+            path = download_kokoro(report, target)
+        elif args.sherpa:
+            path = download_sherpa(report, target)
+        else:
+            path = download(report, target)
     except Exception as exc:
         print(f"Model installation failed: {exc}", file=sys.stderr, flush=True)
         return 1

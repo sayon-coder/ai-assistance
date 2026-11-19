@@ -148,7 +148,7 @@ class HermesClient:
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  model: str = DEFAULT_MODEL, api_key: str = "",
                  env: dict | None = None, home: str | None = None,
-                 opener=None):
+                 opener=None, allow_keyless: bool = False):
         self.host = _normalize_host(host)
         if not is_loopback_host(self.host):
             raise HermesConfigError(
@@ -163,18 +163,18 @@ class HermesClient:
             raise HermesConfigError("Hermes port must be between 1 and 65535")
         self.model = _clean(model) or DEFAULT_MODEL
         key, source = resolve_api_key(api_key, env=env, home=home)
-        if not key:
+        if not key and not allow_keyless:
             raise HermesConfigError(
                 "No Hermes API key found (set HERMES_API_KEY or API_SERVER_KEY "
                 "in the environment or in ~/.hermes/.env)."
             )
-        if len(key) < 16:
+        if key and len(key) < 16:
             raise HermesConfigError(
                 f"The Hermes API key from {source or 'configuration'} is too "
                 "short to be a real secret."
             )
         self._key = key
-        self.key_source = source
+        self.key_source = source or ("none" if not key else source)
         self._opener = opener or urllib.request.build_opener()
 
     # -- basics ------------------------------------------------------------
@@ -190,6 +190,8 @@ class HermesClient:
 
     def redact(self, text) -> str:
         text = str(text or "")
+        if not self._key:
+            return text
         return text.replace(self._key, "<redacted>")
 
     # -- transport ---------------------------------------------------------
@@ -199,9 +201,10 @@ class HermesClient:
         url = self.base_url + path
         data = None
         request_headers = {
-            "Authorization": f"Bearer {self._key}",
             "Accept": "text/event-stream" if stream else "application/json",
         }
+        if self._key:
+            request_headers["Authorization"] = f"Bearer {self._key}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             request_headers["Content-Type"] = "application/json"
@@ -253,6 +256,8 @@ class HermesClient:
 
     def _redact_tree(self, data):
         key = self._key
+        if not key:
+            return data
         if isinstance(data, str):
             return data.replace(key, "<redacted>")
         if isinstance(data, dict):
@@ -282,6 +287,66 @@ class HermesClient:
             raise HermesError("Hermes returned no completion choices.")
         message = choices[0].get("message") or {}
         return str(message.get("content") or "").strip()
+
+    def chat_stream(self, messages: list[dict], timeout: float = 90.0,
+                    on_delta=None,
+                    cancel: threading.Event | None = None) -> str:
+        """Stream a chat completion and return the whole answer.
+
+        ``on_delta`` receives each text fragment as it arrives, which lets the
+        caller start speaking the first sentence instead of waiting for the
+        complete answer.  Reasoning deltas are ignored: only user-visible
+        content is spoken.  Returns ``""`` when the server produced no text
+        (the caller then falls back to a normal request).
+        """
+        payload = {
+            "model": self.model,
+            "messages": list(messages),
+            "stream": True,
+        }
+        parts: list[str] = []
+        with self._request("POST", "/v1/chat/completions", payload=payload,
+                           timeout=timeout, stream=True) as resp:
+            for raw in resp:
+                if cancel is not None and cancel.is_set():
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if not body:
+                    continue
+                if body == "[DONE]":
+                    break
+                try:
+                    event = json.loads(body)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0] or {}
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if not piece:
+                    # Some compatible servers send the final text in
+                    # ``message`` on the last chunk instead of a delta.
+                    message = choice.get("message") or {}
+                    piece = message.get("content") if not parts else None
+                if not piece:
+                    continue
+                piece = str(piece)
+                parts.append(piece)
+                if callable(on_delta):
+                    try:
+                        on_delta(piece)
+                    except Exception:
+                        log.debug("Stream delta callback failed", exc_info=True)
+        return self.redact("".join(parts).strip())
 
     # -- agent runs (multi-step, tools, approvals) ---------------------------
     def submit_run(self, input_text: str, idempotency_key: str = "",
@@ -331,8 +396,8 @@ class HermesClient:
         request = (
             f"GET /v1/runs/{run_id}/events HTTP/1.1\r\n"
             f"Host: {self.host}:{self.port}\r\n"
-            f"Authorization: Bearer {self._key}\r\n"
-            f"Accept: text/event-stream\r\n"
+            + (f"Authorization: Bearer {self._key}\r\n" if self._key else "")
+            + "Accept: text/event-stream\r\n"
             f"\r\n"
         )
         sock.sendall(request.encode())

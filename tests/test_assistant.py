@@ -241,7 +241,7 @@ def test_backend_down_gets_a_polite_spoken_notice():
     controller, _s, speech, states, _f = make(client=fake)
     controller.handle_phrase("why is my internet slow")
     assert wait_until(lambda: not controller.is_busy())
-    assert any("could not reach the ai assistant backend" in text.lower()
+    assert any("cannot reach the local ai gateway" in text.lower()
                for text in speech.said)
     assert any(event["kind"] == "error" for event in states)
     # Nothing was remembered from a failed exchange.
@@ -455,3 +455,78 @@ def test_request_after_a_timeout_still_works():
     assert wait_until(lambda: not controller.is_busy())
     assert speech.said == ["42"]              # the next answer still arrives
     assert controller._timed_out is False
+
+
+# -- streaming and automatic gateway start ------------------------------------
+class FakeStreamingClient(FakeClient):
+    def chat_stream(self, messages, timeout=90.0, on_delta=None, cancel=None):
+        self.chatted.append(messages)
+        pieces = ("Paris is the capital. ", "It sits on the Seine.")
+        for piece in pieces:
+            if on_delta:
+                on_delta(piece)
+        return "Paris is the capital. It sits on the Seine."
+
+
+class AnnounceSpeech(FakeSpeech):
+    def __init__(self):
+        super().__init__()
+        self.announced: list[str] = []
+
+    def say(self, text, announce=True):
+        super().say(text)
+
+    def announce(self, text):
+        self.announced.append(text)
+
+
+def test_streamed_answer_is_spoken_in_sentences_and_logged_once():
+    speech = AnnounceSpeech()
+    states: list[dict] = []
+    controller = AssistantController(
+        settings=lambda: {"ai_enabled": True, "ai_streaming": True},
+        speech=speech,
+        on_state=states.append,
+        client_factory=lambda **kw: FakeStreamingClient(),
+    )
+    assert controller.handle_phrase("what is the capital of france")
+    assert wait_until(lambda: not controller.is_busy())
+    assert speech.said == ["Paris is the capital.", "It sits on the Seine."]
+    assert speech.announced == ["Paris is the capital. It sits on the Seine."]
+    assert any(event["kind"] == "answered" for event in states)
+
+
+class FakeDownClient(FakeClient):
+    allow_autostart = True
+    host = "127.0.0.1"
+    port = 8642
+
+    def __init__(self):
+        super().__init__()
+        self.health_calls = 0
+
+    def health(self, timeout=4.0):
+        self.health_calls += 1
+        if self.health_calls <= 2:
+            raise HermesUnavailable("down")
+        return {"status": "ok"}
+
+
+def test_stopped_gateway_is_started_automatically(monkeypatch):
+    import talcon.hermes_service as service
+
+    calls: list = []
+    monkeypatch.setattr(service, "installed", lambda: True)
+    monkeypatch.setattr(
+        service, "ensure_running",
+        lambda *a, **k: (calls.append((a, k)), (True, "started"))[1],
+    )
+    controller, _s, speech, states, _f = make(
+        settings={"ai_use_agent_runs": False, "ai_autostart_backend": True},
+        client=FakeDownClient(),
+    )
+    assert controller.handle_phrase("what is the weather today")
+    assert wait_until(lambda: not controller.is_busy())
+    assert calls, "the gateway start must be attempted"
+    assert any(event["kind"] == "progress" for event in states)
+    assert any("chat answer" in text for text in speech.said)

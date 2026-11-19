@@ -141,6 +141,14 @@ class StubRuntime(QObject):
     def assistant_backend_status(self):
         return "off"
 
+    def ai_backend_report(self, start_if_down=False):
+        return {"installed": False, "listening": False, "reachable": False,
+                "home": "", "launcher": "", "host": "127.0.0.1",
+                "port": 8642, "detail": "not running"}
+
+    def start_ai_backend(self, wait_seconds=40.0):
+        return False, "not running"
+
     def hide_to_tray(self):
         self.calls.append(("hide_to_tray",))
 
@@ -241,7 +249,7 @@ def test_three_top_right_controls_are_labelled_and_distinct(qapp):
         face.close()
 
 
-def test_switches_call_runtime_and_dashboard_has_no_quick_actions(qapp):
+def test_switches_call_runtime_and_dashboard_has_quick_actions(qapp):
     runtime, face, window = make_window(qapp)
     try:
         window.speech_switch.setChecked(False)
@@ -252,8 +260,9 @@ def test_switches_call_runtime_and_dashboard_has_no_quick_actions(qapp):
         dashboard = window.pages["dashboard"]
         labels = {button.text() for button in dashboard.findChildren(QPushButton)}
         assert "Study Mode" not in labels
-        assert "Listen now" not in labels
-        assert "Mute voice" not in labels
+        assert "Listen now" in labels
+        assert "Mute voice" in labels
+        assert "Voice settings" in labels
         assert "Hide face" not in labels
     finally:
         window.close()

@@ -93,9 +93,20 @@ class CronJobsPage(QWidget):
 
         self._timer = QTimer(self)
         self._timer.setInterval(3000)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._timer.timeout.connect(self.refresh)
-        self._timer.start()
         self.refresh()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.refresh()
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        # No page-wide polling while the user is looking at another section.
+        self._timer.stop()
+        super().hideEvent(event)
 
     # -- construction ------------------------------------------------------
     def _build_form(self) -> QWidget:
@@ -117,6 +128,11 @@ class CronJobsPage(QWidget):
             "Natural-language description (optional)", self.quick_input
         ))
         card.add(row(quick, _stretch(), spacing=8))
+        card.add(footnote(
+            "Type a sentence such as “Open Chrome every day at 9 AM”, then press "
+            "Fill from description. It only fills the fields below; review them and "
+            "press Authorize to create the job."
+        ))
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("For example: Morning browser")
@@ -429,7 +445,7 @@ class CronJobsPage(QWidget):
     def _choose_app(self) -> None:
         picker = ApplicationPicker(self.runtime, parent=self)
         if picker.exec() == ApplicationPicker.DialogCode.Accepted:
-            selected = picker.selected_app()
+            selected = picker.selected_app
             if selected:
                 self._selected_app = selected
                 self.app_name.setText(str(selected.get("name") or selected.get("path") or ""))

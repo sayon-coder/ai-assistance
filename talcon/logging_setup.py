@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import traceback
 from logging.handlers import RotatingFileHandler
 
 from .config import LOGS_DIR, VERSION
 
 LOG_PATH = LOGS_DIR / "talcon.log"
+#: Kept open for the process lifetime so a native crash still lands on disk.
+_CRASH_FILE = None
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
@@ -46,4 +49,26 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         logging.getLogger("talcon.crash").critical("Unhandled exception:\n%s", text)
 
     sys.excepthook = _hook
+
+    # A Qt teardown race can kill the process at C level, where sys.excepthook
+    # never runs.  faulthandler records that stack in logs/crash.log, which is
+    # the only way such a shutdown problem can be diagnosed later.
+    global _CRASH_FILE
+    try:
+        import faulthandler
+
+        _CRASH_FILE = open(LOGS_DIR / "crash.log", "a", buffering=1,
+                           encoding="utf-8", errors="replace")
+        faulthandler.enable(file=_CRASH_FILE, all_threads=True)
+    except Exception:
+        pass
+
+    def _thread_hook(args):
+        logging.getLogger("talcon.crash").critical(
+            "Unhandled exception in thread %s",
+            getattr(getattr(args, "thread", None), "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _thread_hook
     return log

@@ -20,7 +20,16 @@ import threading
 import time
 
 from .app_catalog import normalize_app_name, resolve_application
-from .audio import AdaptiveVad, UtteranceVad, calibrate_microphone, pcm_stats
+from .asr import (
+    ENGINE_SHERPA,
+    create_streaming_recognizer,
+    engine_model_ready,
+    engine_reason,
+    resolve_engine,
+)
+from .asr import sherpa_engine as sherpa_asr
+from .asr import whisper_engine
+from .audio import AudioFrontEnd, AdaptiveVad, UtteranceVad, calibrate_microphone, pcm_stats
 from .commands import (
     build_recognition_grammar,
     is_command_like,
@@ -33,7 +42,7 @@ from .phrase import Hypothesis, PHRASE_TIMEOUT, PhraseAssembler
 log = logging.getLogger("talcon.voice")
 
 SAMPLE_RATE = 16000
-BLOCK_SIZE = 4000  # 0.25 s at 16 kHz
+BLOCK_SIZE = 1600  # 0.10 s at 16 kHz (finer endpointing, still cheap)
 WAKE_ALIASES = ("talcon", "tell can", "tal con", "talc on", "talk on", "talcon")
 WAKE_GRAMMAR = json.dumps([
     "talcon", "tell can", "tal con", "talc on", "talk on", "talcon",
@@ -253,6 +262,19 @@ class VoiceController:
         self._session_lock = threading.Lock()
         self._status = ""
         self._model = None
+        # The engine is resolved once per listener start.  Changing it in
+        # settings restarts the listener (runtime.save_settings does that).
+        self._engine = resolve_engine(self.settings)
+        self._engine_note = engine_reason(self.settings, self._engine)
+        self._sherpa_path = sherpa_asr.resolve_model_path(
+            self.settings.get("sherpa_model_path")
+        )
+        if self._engine != "vosk":
+            log.info("Speech recognition engine: %s (%s)", self._engine, self._engine_note)
+        self._frontend = AudioFrontEnd.from_settings(self.settings)
+        self._frontend_error_logged = False
+        self._whisper = None
+        self._whisper_key = ""
         self._last_manual_thread: threading.Thread | None = None
         self._next_wake_at = 0.0
         self._continuous = False
@@ -532,6 +554,10 @@ class VoiceController:
         if not self._grammar_dirty.is_set():
             return recognizer
         self._grammar_dirty.clear()
+        if self._engine == ENGINE_SHERPA:
+            # The streaming transducer has no grammar; command matching still
+            # happens against the registry after every final transcript.
+            return recognizer
         if not self._current_grammar() or self._model is None:
             return recognizer
         try:
@@ -543,6 +569,17 @@ class VoiceController:
             return recognizer
 
     def _make_recognizer(self, wake: bool = False):
+        if self._engine == ENGINE_SHERPA:
+            # Transducers have no phrase-list grammar; endpointing is handled
+            # by sherpa-onnx and TALCON's own silence windows in parallel.
+            recognizer = create_streaming_recognizer(
+                self.settings,
+                engine=ENGINE_SHERPA,
+                trailing_silence=self._trailing_silence,
+                max_utterance=self._max_utterance,
+            )
+            self._endpointer_status = "sherpa-onnx"
+            return recognizer
         from vosk import KaldiRecognizer
 
         grammar = WAKE_GRAMMAR if wake else self._current_grammar()
@@ -648,6 +685,19 @@ class VoiceController:
         floor = float(self.settings.get("vad_noise_floor", 0.0) or 0.0)
         if floor > 0:
             self.set_noise_floor(floor)
+        frontend = AudioFrontEnd.from_settings(self.settings)
+        if (
+            self._frontend is None
+            or frontend.enabled != self._frontend.enabled
+            or frontend.target_rms != self._frontend.target_rms
+            or frontend.agc != self._frontend.agc
+            or frontend.noise_suppression != self._frontend.noise_suppression
+            or frontend.aec != self._frontend.aec
+        ):
+            self._frontend = frontend
+        # An engine or model change is handled by restarting the listener in
+        # runtime.save_settings; settings that affect the next final only
+        # (Whisper and audio conditioning) apply immediately here.
 
     def set_noise_floor(self, value: float) -> None:
         """Apply a freshly calibrated ambient floor to the live detector."""
@@ -739,6 +789,56 @@ class VoiceController:
         except Exception:
             log.debug("Recogniser reset was not available", exc_info=True)
 
+    def _enhance(self, pcm: bytes) -> bytes:
+        """Condition one microphone block for the selected recogniser.
+
+        The VAD still receives the raw block, so gain or denoising can never
+        hide speech from the endpoint logic.  A front-end failure degrades to
+        the original bytes instead of stopping the listener.
+        """
+        frontend = self._frontend
+        if frontend is None or not frontend.enabled or not pcm:
+            return pcm
+        try:
+            frontend.set_reference_active(self._speech_is_speaking())
+            return frontend.process(pcm)
+        except Exception:
+            if not self._frontend_error_logged:
+                self._frontend_error_logged = True
+                log.exception("Audio front-end failed; passing raw audio through")
+            return pcm
+
+    def _long_question_transcriber(self):
+        """Lazily build the optional faster-whisper pass."""
+        if not self.settings.get("long_question_whisper", False):
+            return None
+        model = str(self.settings.get("whisper_model") or "small.en")
+        if self._whisper is None or self._whisper_key != model:
+            self._whisper = whisper_engine.LongQuestionTranscriber(model)
+            self._whisper_key = model
+        return self._whisper if self._whisper.available() else None
+
+    def _refine_long_question(self, text: str, audio: bytes | None) -> str:
+        """Re-decode a long question with faster-whisper when it is enabled.
+
+        Commands are never eligible: the prefix test only accepts question
+        wording such as "explain…" or "what is…".  The refined text is used
+        only by the natural-language fallback, not by command matching.
+        """
+        if not whisper_engine.is_long_question(text):
+            return text
+        pcm = audio or self._last_capture_pcm
+        if not pcm:
+            return text
+        transcriber = self._long_question_transcriber()
+        if transcriber is None:
+            return text
+        refined = transcriber.transcribe(pcm)
+        if refined and refined.strip() and refined.strip() != text.strip():
+            log.info("Long question re-decoded with faster-whisper: %s", refined)
+            return refined.strip()
+        return text
+
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -774,30 +874,66 @@ class VoiceController:
 
     # -- main loop ---------------------------------------------------------
     def _run(self) -> None:
-        path = self._model_path()
-        if not model_is_ready(path):
+        from .win_threads import lower_current_thread
+
+        lower_current_thread()
+        # Re-resolve at start time: the settings may have changed since the
+        # controller was constructed (and the model may have just installed).
+        self._engine = resolve_engine(self.settings)
+        self._engine_note = engine_reason(self.settings, self._engine)
+        self._sherpa_path = sherpa_asr.resolve_model_path(
+            self.settings.get("sherpa_model_path")
+        )
+        if not engine_model_ready(self.settings):
             self._set_status("Speech model missing · download it in Voice settings")
-            log.warning("Vosk model not found at %s", path)
+            log.warning("Speech model for %s is not ready (%s)",
+                        self._engine, self._engine_note)
             return
         try:
             import sounddevice as sd
-            from vosk import KaldiRecognizer
-            import vosk as vosk_module
-            self._vosk_module = vosk_module
         except Exception as exc:
             self._set_status(f"Speech recognition unavailable · {exc}")
-            log.exception("Vosk/sounddevice import failed")
+            log.exception("sounddevice import failed")
             return
 
-        try:
-            self._model = _load_model(str(path))
-        except Exception as exc:
-            self._set_status(f"Speech model could not be loaded · {exc}")
-            log.exception("Could not load the Vosk model")
-            return
-        # Rebuild once the model is available so app phrases containing words
-        # the small model cannot pronounce are filtered before recognition.
-        self.refresh_grammar()
+        if self._engine == ENGINE_SHERPA:
+            try:
+                # Construct once now so a broken model fails before the
+                # microphone stream opens.
+                probe = self._make_recognizer()
+                self._reset(probe)
+                del probe
+            except Exception as exc:
+                # A corrupt or incompatible sherpa model must not leave the
+                # user without voice input: fall back to Vosk for this run.
+                log.exception("Could not load sherpa-onnx; falling back to Vosk")
+                self._engine_note = f"sherpa-onnx failed ({exc}); using Vosk"
+                self._engine = "vosk"
+                self._set_status("Using Vosk · sherpa-onnx could not start")
+            if self._engine == ENGINE_SHERPA:
+                self._model = None
+                self.refresh_grammar()
+
+        if self._engine != ENGINE_SHERPA:
+            path = self._model_path()
+            if not model_is_ready(path):
+                self._set_status("Speech model missing · download it in Voice settings")
+                log.warning("Vosk fallback model not found at %s", path)
+                return
+        if self._engine != ENGINE_SHERPA:
+            path = self._model_path()
+            try:
+                import vosk as vosk_module
+
+                self._vosk_module = vosk_module
+                self._model = _load_model(str(path))
+            except Exception as exc:
+                self._set_status(f"Speech model could not be loaded · {exc}")
+                log.exception("Could not load the Vosk model")
+                return
+            # Rebuild once the model is available so app phrases containing
+            # words the small model cannot pronounce are filtered.
+            self.refresh_grammar()
 
         device = self._device()
         while not self._stop.is_set():
@@ -921,16 +1057,17 @@ class VoiceController:
             must wait for it, so slow speech is never cut short."""
             return last_voice_at is None or now - last_voice_at >= self._trailing_silence
 
-        def flush() -> str | None:
+        def flush(force: bool = False) -> str | None:
             now = time.monotonic()
             # Latency: when the assembler has already matched a complete
             # registered command, run it immediately instead of waiting for
             # trailing silence.  Prefix-pending assemblies still wait so a
             # slow second word can finish the command.
             matched = current_assembly is not None and bool(current_assembly.matched)
-            if not matched and not silence_elapsed(now):
+            if not force and not matched and not silence_elapsed(now):
                 return None
-            if not matched and current_assembly is not None and now - last_final_at < self._trailing_silence:
+            if (not force and not matched and current_assembly is not None
+                    and now - last_final_at < self._trailing_silence):
                 return None
             if current_assembly is not None and current_primary:
                 action = self._dispatch_transcript(
@@ -1040,6 +1177,7 @@ class VoiceController:
                     utterance_pcm.clear()
                     continue
 
+                previous_voice_at = last_voice_at
                 state = self._vad.update(pcm)
                 last_state = state
                 now = time.monotonic()
@@ -1066,21 +1204,36 @@ class VoiceController:
                 if state.speech:
                     partial_done = False
                 # Every block, including warm-up and pre-roll, is already
-                # retained here and submitted to Vosk below. Do not prepend the
-                # VAD pre-roll again: doing so duplicates and reorders samples.
-                utterance_pcm.extend(pcm)
+                # retained here and submitted to the recogniser below. Do not
+                # prepend the VAD pre-roll again: doing so duplicates and
+                # reorders samples.  The VAD above saw the raw block; the
+                # engine sees the conditioned block.
+                enhanced = self._enhance(pcm)
+                utterance_pcm.extend(enhanced)
                 pcm_limit = int(GENERIC_MAX_SECONDS * SAMPLE_RATE * 2)
                 if len(utterance_pcm) > pcm_limit:
                     del utterance_pcm[:-pcm_limit]
 
                 try:
-                    if recognizer.AcceptWaveform(pcm):
+                    if recognizer.AcceptWaveform(enhanced):
                         payload = json.loads(recognizer.Result())
                         hypotheses = [
                             item for item in _result_hypotheses(payload)
                             if not _has_unknown(item.text)
                         ]
                         raw_text = str(payload.get("text") or "").strip()
+                        # A final that starts after a full silence window is
+                        # a new utterance.  Flush the previous assembly now,
+                        # otherwise two commands separated by a long pause
+                        # can be joined (or the first one lost) just because
+                        # the new final arrived before the next empty-queue
+                        # tick.
+                        if (current_assembly is not None
+                                and previous_voice_at is not None
+                                and last_final_at
+                                and now - previous_voice_at >= self._trailing_silence
+                                and now - last_final_at >= self._trailing_silence):
+                            flush(force=True)
                         if hypotheses and state.speech_seen:
                             current_hypotheses = hypotheses
                             current_primary = hypotheses[0].text
@@ -1165,7 +1318,13 @@ class VoiceController:
                 confidence=assembly.confidence,
                 reason="No confident registered command matched",
             )
-            self._handle_unintelligible(assembly.heard, audio_q)
+            # Long questions may justify a slower, more accurate second pass.
+            # The refined text still goes through natural-language handling
+            # only; it is never matched as a command.
+            refined = self._refine_long_question(assembly.heard, audio)
+            if refined != assembly.heard:
+                self._emit("last_heard", refined)
+            self._handle_unintelligible(refined, audio_q)
         return None
 
     def _execute_assembly(self, assembly, audio_q: queue.Queue, now: float,
@@ -1533,7 +1692,7 @@ class VoiceController:
                     except queue.Empty:
                         continue
                     try:
-                        finished = recognizer.AcceptWaveform(pcm)
+                        finished = recognizer.AcceptWaveform(self._enhance(pcm))
                         if finished:
                             heard = json.loads(recognizer.Result()).get("text", "")
                         else:
@@ -1574,7 +1733,7 @@ class VoiceController:
                     continue
 
                 try:
-                    if recognizer.AcceptWaveform(pcm):
+                    if recognizer.AcceptWaveform(self._enhance(pcm)):
                         text = json.loads(recognizer.Result()).get("text", "")
                     else:
                         text = json.loads(recognizer.PartialResult()).get("partial", "")
@@ -1668,7 +1827,10 @@ class VoiceController:
             if action in (None, "none", "unknown") and phrase:
                 # If no safe command matched, use the same repeat policy as
                 # continuous mode.  A missing transcript stays silent.
-                self._handle_unintelligible(phrase, audio_q)
+                self._handle_unintelligible(
+                    self._refine_long_question(phrase, self._last_capture_pcm),
+                    audio_q,
+                )
             # Wait for any spoken confirmation before reopening the microphone.
             self._wait_for_speech_end(20.0)
             self._drain(audio_q)
@@ -1772,7 +1934,7 @@ class VoiceController:
                 self._drain(audio_q)
                 return "", heard_speech, True
             try:
-                data = audio_q.get(timeout=0.2)
+                data = audio_q.get(timeout=0.1)
             except queue.Empty:
                 if not heard_speech and time.monotonic() - started > self._start_timeout:
                     return "", False, False
@@ -1782,7 +1944,8 @@ class VoiceController:
 
             state = self._vad.update(data)
             last_state = state
-            pcm_buffer.extend(data)
+            enhanced = self._enhance(data)
+            pcm_buffer.extend(enhanced)
             pcm_limit = int(self._max_utterance * SAMPLE_RATE * 2)
             if len(pcm_buffer) > pcm_limit:
                 del pcm_buffer[:-pcm_limit]
@@ -1792,7 +1955,7 @@ class VoiceController:
                     last_voice = time.monotonic()
 
             try:
-                if recognizer.AcceptWaveform(data):
+                if recognizer.AcceptWaveform(enhanced):
                     payload = json.loads(recognizer.Result())
                     hypotheses = [
                         item for item in _result_hypotheses(payload)
@@ -1856,8 +2019,8 @@ class VoiceController:
 
     # -- manual listening when the wake loop is not running ----------------
     def _manual_session(self) -> None:
-        path = self._model_path()
-        if not model_is_ready(path):
+        self._engine = resolve_engine(self.settings)
+        if not engine_model_ready(self.settings):
             self._set_status("Speech model missing · download it in Voice settings")
             return
         try:
@@ -1865,12 +2028,14 @@ class VoiceController:
         except Exception as exc:
             self._set_status(f"Microphone unavailable · {exc}")
             return
-        try:
-            if self._model is None:
-                self._model = _load_model(str(path))
-        except Exception as exc:
-            self._set_status(f"Speech model could not be loaded · {exc}")
-            return
+        if self._engine != ENGINE_SHERPA:
+            path = self._model_path()
+            try:
+                if self._model is None:
+                    self._model = _load_model(str(path))
+            except Exception as exc:
+                self._set_status(f"Speech model could not be loaded · {exc}")
+                return
 
         audio_q: queue.Queue = queue.Queue(maxsize=16)
 

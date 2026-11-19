@@ -131,8 +131,26 @@ Kokoro runs on the CPU, loads only while speaking and unloads after 90 seconds
 of silence, which keeps a modest laptop responsive. Its default voice is
 **George** (calm British male); other voices are listed in Voice Settings.
 
-Everything is processed locally with Vosk. Recordings are never saved and no
-voice files are bundled.
+**Pace between sentences.** Streamed answers are spoken sentence by sentence.
+TALCON synthesises the next sentence while the current one is still playing, so
+the next words are ready before the full stop ends. **Pause after a full stop**
+in Voice Settings sets the beat of silence that separates sentences (one second
+by default; slide it down for a brisker delivery).
+
+Everything is processed locally. Vosk is the default recogniser; Voice Settings
+also offers **Automatic** and **sherpa-onnx** engines when that optional package
+and model are installed, with Vosk used automatically as the fallback. Shared
+automatic gain and noise suppression improve quiet or distant speech, and an
+optional faster-whisper pass is available for long questions only. Recordings
+are never saved and no voice files are bundled.
+
+To measure the engines on your own machine instead of guessing:
+
+```bat
+.venv\Scripts\python.exe scripts\benchmark_speech.py
+```
+
+The report includes word error rate and latency at 0.5 m, 2 m and 3 m.
 
 ## AI answers (on by default)
 

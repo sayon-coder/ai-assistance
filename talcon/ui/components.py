@@ -81,7 +81,7 @@ class Switch(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        off = QColor(51, 51, 51)
+        off = QColor("#8A8A8A")
         on = QColor(theme.ACCENT)
         track = QColor(
             int(off.red() + (on.red() - off.red()) * self._pos),
@@ -196,8 +196,21 @@ class FacePreview(QWidget):
         self._next_state = self._last + self.HOLD_SECONDS
         self._timer = QTimer(self)
         self._timer.setInterval(33)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._timer.timeout.connect(self._tick)
-        self._timer.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._last = time.monotonic()
+        self._next_state = self._last + self.HOLD_SECONDS
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        # This preview used to repaint at 30 FPS forever, even when another
+        # page was showing.  An animation nobody can see is pure battery drain.
+        self._timer.stop()
+        super().hideEvent(event)
 
     def _tick(self) -> None:
         now = time.monotonic()

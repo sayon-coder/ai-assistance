@@ -1,4 +1,4 @@
-"""UI tests for the solid black theme, opacity and the new editor section."""
+"""UI tests for the light-grey theme, rounded shell and the editor section."""
 from __future__ import annotations
 
 import shiboken6
@@ -39,26 +39,32 @@ def dispose_widgets(qapp):
     qapp.processEvents()
 
 
-def test_palette_is_solid_black_and_opaque():
-    assert theme.BG == "#080808"
-    assert theme.SIDEBAR == "#111111"
-    assert theme.SURFACE == "#181818"
-    assert theme.INPUT == "#101010"
-    assert theme.BORDER == "#292929"
-    assert theme.TEXT == "#FFFFFF"
-    assert theme.MUTED == "#A0A0A0"
+def test_palette_is_light_grey_and_transparent_at_the_window_edge():
+    assert theme.BG == "#A9A9A9"
+    assert theme.SIDEBAR == "#B3B3B3"
+    assert theme.SURFACE == "#D8D8D8"
+    assert theme.INPUT == "#F1F1F1"
+    assert theme.BORDER == "#9A9A9A"
+    assert theme.TEXT == "#1C1C1C"
+    assert theme.MUTED == "#4F4F4F"
     assert "QFrame#Shell" in theme.STYLESHEET
+    assert f"border: 1px solid {theme.WINDOW_BORDER};" in theme.STYLESHEET
+    assert "border-radius: 16px;" in theme.STYLESHEET
     assert f"background: {theme.BG};" in theme.STYLESHEET
     assert f"background: {theme.SURFACE};" in theme.STYLESHEET
     assert f"background: {theme.INPUT};" in theme.STYLESHEET
 
 
-def test_control_center_is_opaque_and_resizable(qapp):
+def test_control_center_has_rounded_edges_and_is_resizable(qapp):
     runtime, face, window = make_window(qapp)
     try:
-        assert not window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # The outer margin is translucent so the rounded shell does not sit
+        # inside an opaque black square.
+        assert window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         assert window.testAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        assert window.styleSheet() == theme.STYLESHEET
+        # The theme is applied once on the QApplication; a per-window copy
+        # would re-parse the whole stylesheet for no reason.
+        assert window.styleSheet() == ""
         assert window.minimumWidth() >= 980
         assert window.minimumHeight() >= 660
         assert hasattr(window, "size_grip")

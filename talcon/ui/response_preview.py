@@ -107,7 +107,7 @@ class _WaveIcon(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(38, 46, 60))
+        painter.setBrush(QColor("#D5E1F5"))
         painter.drawRoundedRect(
             QRectF(0, 0, self.width(), self.height()), 9, 9
         )
@@ -116,7 +116,7 @@ class _WaveIcon(QWidget):
         heights = (0.34, 0.62, 0.9, 0.52, 0.26)
         total = len(heights) * bar_width + (len(heights) - 1) * gap
         x = (self.width() - total) / 2.0
-        painter.setBrush(QColor("#8FC0FF"))
+        painter.setBrush(QColor(theme.ACCENT))
         for fraction in heights:
             height = max(3.0, (self.height() - 10) * fraction)
             y = (self.height() - height) / 2.0
@@ -138,7 +138,7 @@ class _Chevron(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(QColor("#A9B6C9"), 1.6)
+        pen = QPen(QColor("#6A6A6A"), 1.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         width, height = self.width(), self.height()
@@ -188,7 +188,7 @@ class ResponsePreview(QWidget):
         self.label.setWordWrap(False)
         self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.label.setStyleSheet(
-            "color: #E8F0FF; font-size: 9pt; background: transparent;"
+            "color: #1C1C1C; font-size: 9pt; background: transparent;"
         )
         self.label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
@@ -211,8 +211,13 @@ class ResponsePreview(QWidget):
         # dragged, the bar moves or the avatar is hidden/shown.
         self._follow = QTimer(self)
         self._follow.setInterval(300)
+        self._follow.setTimerType(Qt.TimerType.CoarseTimer)
         self._follow.timeout.connect(self._sync_visibility)
-        self._follow.start()
+
+    def _start_follow(self) -> None:
+        """Follow the avatar only while there is something to show."""
+        if not self._follow.isActive():
+            self._follow.start()
 
     # -- public API --------------------------------------------------------
     def set_anchor_provider(self, provider) -> None:
@@ -235,12 +240,14 @@ class ResponsePreview(QWidget):
         self._progress = ""
         self._shown_at = time.monotonic()
         self._apply_text()
+        self._start_follow()
         self._sync_visibility()
 
     def dismiss(self) -> None:
         """Hide the preview until another response arrives."""
         self._has_response = False
         self._progress = ""
+        self._follow.stop()
         self.hide()
 
     # -- assistant progress --------------------------------------------------
@@ -254,6 +261,7 @@ class ResponsePreview(QWidget):
         self._has_response = False
         self._shown_at = time.monotonic()
         self._apply_text()
+        self._start_follow()
         self._sync_visibility()
 
     def clear_progress(self) -> None:
@@ -288,8 +296,8 @@ class ResponsePreview(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect().adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor("#33415C"), 1))
-        painter.setBrush(QColor(18, 21, 27, 245))
+        painter.setPen(QPen(QColor("#7A7A7A"), 1))
+        painter.setBrush(QColor(250, 250, 250, 245))
         painter.drawRoundedRect(rect, 14, 14)
         # A slim blue edge ties the box to the avatar's accent without adding
         # any new visual language.
@@ -317,6 +325,8 @@ class ResponsePreview(QWidget):
         if anchor is None or not (self._has_response or self._progress):
             if self.isVisible():
                 self.hide()
+            if not (self._has_response or self._progress):
+                self._follow.stop()
             return
         if (
             not self._speaking

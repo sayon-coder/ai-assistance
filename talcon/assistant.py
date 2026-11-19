@@ -102,6 +102,8 @@ class AssistantController:
         self._cache_signature: tuple = ()
         self._ack_timer: threading.Timer | None = None
         self._timed_out = False
+        #: True when this request's answer was already spoken as it streamed.
+        self._streamed_spoken = False
 
     # -- live configuration --------------------------------------------------
     def _setting(self, key: str, default=None):
@@ -239,6 +241,9 @@ class AssistantController:
             self._worker.start()
 
     def _worker_loop(self) -> None:
+        from .win_threads import lower_current_thread
+
+        lower_current_thread()
         while not self._stopped.is_set():
             with self._lock:
                 phrase = self._queue.pop(0) if self._queue else None
@@ -287,7 +292,10 @@ class AssistantController:
             )
         except HermesConfigError as exc:
             log.warning("Hermes is not configured: %s", exc)
-            self._fail(str(exc))
+            self._fail(
+                "The local AI is not configured yet, sir. Open Voice Settings "
+                "and check the Hermes address and API key."
+            )
             return None
         except Exception:
             log.exception("Could not build the Hermes client")
@@ -312,6 +320,7 @@ class AssistantController:
 
     def _run_request(self, phrase: str) -> None:
         self._configure_cache()
+        self._streamed_spoken = False
         # Look the answer up before any client work: a hit needs no backend at
         # all, so it costs zero network requests and answers immediately.
         key, fingerprint = self._cache_key(phrase)
@@ -326,20 +335,13 @@ class AssistantController:
         client = self._get_client()
         if client is None:
             return
-        # Fail fast when the local gateway is not running instead of leaving
-        # the user listening to "Let me think about that" for a whole timeout.
-        try:
-            client.health(timeout=2.5)
-        except HermesUnavailable:
-            self._fail("I could not reach the AI assistant backend, sir. "
-                       "Please start Hermes and try again.")
+        # Fail fast when the local gateway is not usable instead of leaving the
+        # user listening to "Let me think about that" for a whole timeout.  A
+        # installed-but-stopped Hermes is started here, automatically.
+        failure = self._ensure_backend(client)
+        if failure:
+            self._fail(failure)
             return
-        except HermesAuthError:
-            self._fail("The AI assistant was refused by the backend. "
-                       "Please check the Hermes API key.")
-            return
-        except HermesError:
-            pass
         features = self._features(client).get("features", {})
         timeout = self._request_timeout()
         self._timed_out = False
@@ -360,11 +362,16 @@ class AssistantController:
             else:
                 answer, tools_used = self._via_chat(client, phrase, timeout)
         except HermesUnavailable:
-            self._fail("I could not reach the AI assistant backend, sir.")
+            self._fail(
+                "I could not reach the local AI gateway on "
+                f"{getattr(client, 'host', '127.0.0.1')}:"
+                f"{getattr(client, 'port', DEFAULT_PORT)}, sir. Open Voice "
+                "Settings to check it."
+            )
             return
         except HermesAuthError:
-            self._fail("The AI assistant was refused by the backend. "
-                       "Please check the Hermes API key.")
+            self._fail("The local AI gateway rejected the API key, sir. "
+                       "Please check the key in your Hermes .env file.")
             return
         except HermesError as exc:
             log.warning("Hermes request failed: %s", client.redact(exc))
@@ -386,18 +393,31 @@ class AssistantController:
         if key and is_cacheable(phrase, answer, tools_used):
             if self._cache.put(key, answer, fingerprint):
                 log.info("Assistant answer cached (%d entries)", len(self._cache))
-        self._deliver(phrase, answer)
+        spoken = bool(getattr(self, "_streamed_spoken", False))
+        self._deliver(phrase, answer, spoken=spoken)
 
-    def _deliver(self, phrase: str, answer: str) -> None:
+    def _deliver(self, phrase: str, answer: str, spoken: bool = False) -> None:
         """Publish one final answer: context, UI events and speech.
 
         Cache hits and fresh answers share this path exactly, so a hit still
         becomes its own History entry, still updates the preview, and is still
         spoken by the local Kokoro speech engine.
+
+        ``spoken`` is True when a streamed answer was already queued sentence
+        by sentence; the transcript is then published without repeating it.
         """
         self._cancel_ack()
         self._remember(phrase, answer)
         self._emit("answered", answer)
+        if spoken:
+            announce = getattr(self.speech, "announce", None)
+            if callable(announce):
+                try:
+                    announce(answer)
+                except Exception:
+                    log.exception("Assistant could not publish the answer")
+                return
+            return
         # The speech engine's utterance hook publishes this text to the
         # preview and the session history; nothing else needs to be wired.
         self._safe_say(answer)
@@ -419,6 +439,77 @@ class AssistantController:
             phrase = self._busy_phrase
         log.warning("Assistant request timed out (%r); stopping it", phrase[:120])
         self.cancel()
+
+    def _ensure_backend(self, client: HermesClient) -> str:
+        """Return ``""`` when the gateway is usable, else a spoken reason.
+
+        A Hermes install whose gateway is simply not running is started here.
+        That is the common case on a fresh sign-in: the files and key are all
+        present, only nothing is listening on the loopback API port.
+        """
+        try:
+            client.health(timeout=2.5)
+            return ""
+        except HermesAuthError:
+            return ("The local AI gateway is running but rejected the API key, "
+                    "sir. Please check the key in your Hermes .env file.")
+        except HermesUnavailable:
+            pass
+        except HermesError:
+            # The server answered, just not with a documented /health payload.
+            return ""
+
+        from .hermes_service import ensure_running, installed
+
+        host = str(getattr(client, "host", "127.0.0.1"))
+        port = int(getattr(client, "port", DEFAULT_PORT) or DEFAULT_PORT)
+        can_autostart = bool(
+            getattr(client, "allow_autostart", isinstance(client, HermesClient))
+        )
+        if (not bool(self._setting("ai_autostart_backend", True))
+                or not can_autostart):
+            detail = (f"Nothing is listening on {host}:{port}."
+                      if not installed() else
+                      "The Hermes gateway is installed but not running.")
+            log.warning("Hermes unavailable: %s", detail)
+            return (f"I cannot reach the local AI gateway on {host}:{port}, "
+                    "sir. Please start Hermes, or switch on automatic start in "
+                    "Voice Settings.")
+
+        self._emit("progress", "Starting the local AI gateway…")
+        # The start can take up to half a minute; say why instead of leaving the
+        # generic "Let me think about that" filler to explain the wait.
+        self._cancel_ack()
+        self._safe_say("Starting the local AI gateway, sir. One moment.")
+        started, detail = ensure_running(
+            host, port, autostart=True,
+            on_progress=lambda text: self._emit("progress", text),
+        )
+        if not started:
+            log.warning("Hermes gateway did not start: %s", detail)
+            if not installed():
+                return ("The local AI gateway is not running, sir, and Hermes "
+                        "is not installed on this PC. Open Voice Settings for "
+                        "the AI setup.")
+            return ("I tried to start the local Hermes gateway but it did not "
+                    "answer, sir. Open Voice Settings and press Test "
+                    "connection for the exact reason.")
+
+        # The port is open; give the authorised health check a few tries while
+        # the gateway finishes loading its agent.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                client.health(timeout=3.0)
+                self._caps = None
+                return ""
+            except HermesAuthError:
+                return ("The local AI gateway started but rejected the API "
+                        "key, sir. Please check your Hermes .env file.")
+            except HermesError:
+                time.sleep(0.5)
+        return ("The gateway opened its port but did not answer the health "
+                "check, sir. Please look at the Hermes gateway log.")
 
     def _via_runs(self, client: HermesClient, phrase: str,
                   timeout: float = RUN_TIMEOUT) -> tuple[str, bool]:
@@ -499,7 +590,66 @@ class AssistantController:
             messages.append(turn)
         messages.append({"role": "user", "content": phrase})
         self._emit("working", phrase)
+        if (bool(self._setting("ai_streaming", True))
+                and hasattr(client, "chat_stream")):
+            text = self._via_chat_stream(client, messages, timeout)
+            if text:
+                return text, False
+            # The server ignored ``stream`` and returned no text; fall back to
+            # the ordinary request so the user still gets an answer.
+            self._emit("working", phrase)
         return client.chat(messages, timeout=timeout), False
+
+    def _via_chat_stream(self, client: HermesClient, messages: list[dict],
+                         timeout: float) -> str:
+        """Speak the answer sentence by sentence while it is still arriving."""
+        buffer = ""
+        spoken_any = False
+
+        def speak_sentence(sentence: str) -> None:
+            nonlocal spoken_any
+            sentence = sentence.strip()
+            if not sentence:
+                return
+            say = getattr(self.speech, "say", None)
+            if not callable(say):
+                return
+            try:
+                say(sentence, announce=False)
+            except TypeError:
+                say(sentence)
+            spoken_any = True
+
+        def drain(final: bool = False) -> None:
+            nonlocal buffer
+            while True:
+                match = re.search(r"[.!?](?=\s|$)", buffer)
+                if match is None:
+                    break
+                speak_sentence(buffer[:match.end()])
+                buffer = buffer[match.end():].lstrip()
+            # A long unpunctuated answer still needs to start speaking early.
+            while len(buffer) >= 180:
+                cut = buffer.rfind(" ", 0, 180)
+                if cut < 60:
+                    cut = 180
+                speak_sentence(buffer[:cut])
+                buffer = buffer[cut:].lstrip()
+            if final and buffer.strip():
+                speak_sentence(buffer)
+                buffer = ""
+
+        def on_delta(piece) -> None:
+            nonlocal buffer
+            buffer += str(piece or "")
+            drain()
+
+        text = client.chat_stream(
+            messages, timeout=timeout, on_delta=on_delta, cancel=self._cancel
+        )
+        drain(final=True)
+        self._streamed_spoken = bool(spoken_any)
+        return str(text or "").strip()
 
     # -- RAM conversation context ----------------------------------------
     def _system_prompt(self) -> str:

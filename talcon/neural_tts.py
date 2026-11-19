@@ -4,10 +4,11 @@ Hardware decision
 -----------------
 TALCON targets a Ryzen 5 3550H with 16 GB RAM, a GTX 1650 (4 GB) and no CUDA
 toolkit.  Measured on that machine, the quantised Kokoro int8 model loads in
-about 1.3 s and synthesises speech at roughly 1.2× the length of the audio on
-the CPU.  That is not fast enough to run permanently, but it is perfectly
-usable for the short, Jarvis-style sentences TALCON speaks when the model is
-loaded lazily and released after a quiet period.
+about 1.5 s.  A single synthesis call runs at only about half of realtime,
+which is slower than playback; three calls at once reach roughly 0.85×, which
+is enough to keep a queue of sentences ahead of the speaker.  That is why the
+synthesiser is a small worker pool and why the speech layer submits several
+sentences before playback starts.
 
 DirectML (the GPU path) rejects this model's ``ConvTranspose`` node, so the CPU
 provider is used deliberately.  Everything stays local: no API key, no cloud
@@ -74,6 +75,23 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 #: Long sentences are split at clauses.  Smaller chunks let the first words
 #: start playing sooner; the pipelined synthesiser hides most of the rest.
 _MAX_CHUNK = 200
+
+#: Silence after a full stop when more speech is already queued.  Synthesis
+#: runs ahead of playback, so without this the sentences would run together;
+#: one second leaves the natural beat a speaker would take.
+DEFAULT_SENTENCE_PAUSE = 1.0
+
+#: Concurrent synthesis calls.  Measured on the target Ryzen 5, one Kokoro
+#: call at a time runs at about 0.5x realtime, which cannot keep up with
+#: playback; three concurrent calls reach about 0.85x and stay ahead.  The
+#: phonemiser is serialised because espeak-ng keeps global state.
+SYNTH_WORKERS = 3
+
+
+def _ends_sentence(text: str) -> bool:
+    """True when ``text`` finishes a thought (full stop, question or bang)."""
+    tail = str(text or "").rstrip().rstrip("\"'”’)]")
+    return tail.endswith((".", "!", "?"))
 
 
 def model_paths() -> tuple[Path | None, Path]:
@@ -197,12 +215,16 @@ def wav_bytes(samples, sample_rate: int, volume: float = 1.0) -> bytes:
 def _inference_threads() -> int:
     """Pick a CPU thread count that is fast without starving the UI/mic.
 
-    The target laptop has a 4-core/8-thread Ryzen 5.  Letting ONNX Runtime use
-    all logical cores was measurably slower than four threads, and it also
-    competed with the microphone and UI threads.
+    Measured on the target laptop's Ryzen 5 (4 cores / 8 logical), a 4.6 s
+    sentence took 8.2 s with four intra-op threads and 7.4 s with six.  More
+    than six was slower again, and using every logical core competed with the
+    microphone and UI threads.  Six threads is the sweet spot for eight
+    logical cores; smaller machines get proportionally fewer.
     """
     logical = os.cpu_count() or 4
-    return max(2, min(6, logical // 2))
+    if logical >= 8:
+        return 6
+    return max(2, min(6, logical - 1))
 
 
 def _load_engine(model: Path, voices: Path):
@@ -230,6 +252,30 @@ def _load_engine(model: Path, voices: Path):
         return Kokoro(str(model), str(voices))
 
 
+class _SpeechJob:
+    """One utterance, synthesised ahead of playback.
+
+    ``audio`` receives ``((index, wav, seconds, total, rate), pause_after)``
+    tuples as the synthesis thread produces them, then a single ``None``.
+    """
+
+    def __init__(self, text, chunks, engine, voice, language, speed, volume,
+                 epoch, on_start=None):
+        self.text = str(text)
+        self.chunks = list(chunks)
+        self.engine = engine
+        self.voice = voice
+        self.language = language
+        self.speed = speed
+        self.volume = volume
+        self.epoch = int(epoch)
+        self.on_start = on_start
+        self.audio: queue.Queue = queue.Queue()
+        self.cancel = threading.Event()
+        self.error = ""
+        self.finished = False
+
+
 class KokoroBackend:
     """Lazily loaded Kokoro synthesiser with a persistent-host-like interface."""
 
@@ -245,11 +291,22 @@ class KokoroBackend:
         self._language = DEFAULT_LANGUAGE
         self._rate = 0
         self._volume = 90
-        self._stopped = threading.Event()
+        self._closed = threading.Event()
         self._unload_timer: threading.Timer | None = None
         self._used: dict = {}
         self._last_spoken = ""
         self._voice_ids: list[str] = []
+        # Speech generation: bumping the epoch discards jobs already queued or
+        # in flight when the user interrupts TALCON.
+        self._epoch = 0
+        self._outstanding = 0
+        self._outstanding_lock = threading.Lock()
+        self._synth_queue: queue.Queue = queue.Queue()
+        self._synth_threads: list[threading.Thread] = []
+        self._phoneme_lock = threading.Lock()
+        self._sentence_pause = DEFAULT_SENTENCE_PAUSE
+        self._silence_cache: dict = {}
+        self._silence_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
     def ensure_started(self, timeout: float = 25.0) -> bool:
@@ -306,16 +363,35 @@ class KokoroBackend:
         self._unload_timer = None
         if timer is not None:
             timer.cancel()
-        self._stopped.set()
+        self._closed.set()
         self.stop_speaking()
+        for _ in self._synth_threads:
+            self._synth_queue.put(None)
+        threads = list(self._synth_threads)
+        self._synth_threads = []
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.5)
         with self._lock:
             self._engine = None
             self._voice_ids = []
 
     def stop_speaking(self) -> None:
         """Interrupt playback immediately (the model stays loaded)."""
-        self._stopped.set()
+        with self._outstanding_lock:
+            self._epoch += 1
+            self._outstanding = 0
+        self._cancel_queued_jobs()
         self._purge_audio()
+
+    def _cancel_queued_jobs(self) -> None:
+        try:
+            while True:
+                job = self._synth_queue.get_nowait()
+                if job is not None:
+                    job.cancel.set()
+        except queue.Empty:
+            pass
 
     @staticmethod
     def _purge_audio() -> None:
@@ -332,6 +408,14 @@ class KokoroBackend:
 
     def set_volume(self, volume: int) -> None:
         self._volume = max(0, min(100, int(volume)))
+
+    def set_sentence_pause(self, seconds: float) -> None:
+        """Set the beat of silence after each full stop (0-3 seconds)."""
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            value = DEFAULT_SENTENCE_PAUSE
+        self._sentence_pause = max(0.0, min(3.0, value))
 
     def request_voice(self, name: str) -> bool:
         candidate = str(name or "").strip()
@@ -414,100 +498,249 @@ class KokoroBackend:
         return dict(self._used or {})
 
     supports_playback_start = True
+    #: The speech queue can submit the next sentence while this one plays.
+    supports_pipelining = True
+
+    def submit(self, text: str, on_start=None) -> "_SpeechJob | None":
+        """Start synthesising ``text`` now and play it later with :meth:`play`.
+
+        This is what removes the long pause after each full stop.  Speech that
+        arrives sentence by sentence is handed to the synthesis thread
+        immediately, so the next sentence is already audio by the time the
+        current one finishes playing.
+        """
+        if not str(text or "").strip():
+            return None
+        if self._closed.is_set():
+            return None
+        self._schedule_unload()
+        if not self.ensure_started():
+            return None
+        chunks = split_for_speech(text)
+        if not chunks:
+            return None
+        with self._lock:
+            engine = self._engine
+            voice = self._voice
+            language = self._language
+        if engine is None:
+            self._last_error = "The Kokoro model was released; please try again."
+            return None
+        job = _SpeechJob(
+            text=text, chunks=chunks, engine=engine, voice=voice,
+            language=language,
+            speed=max(0.6, min(1.4, 1.0 + (self._rate * 0.04))),
+            volume=self._volume / 100.0,
+            epoch=self._epoch, on_start=on_start,
+        )
+        with self._outstanding_lock:
+            self._outstanding += 1
+        self._ensure_synth_threads()
+        self._synth_queue.put(job)
+        return job
+
+    def play(self, job: "_SpeechJob | None") -> bool:
+        """Play a submitted job, blocking until its audio has finished."""
+        if job is None:
+            return False
+        return self._play_job(job)
+
+    def discard(self, job: "_SpeechJob | None") -> None:
+        """Drop a job that was submitted but will not be played."""
+        if job is None:
+            return
+        job.cancel.set()
+        self._finish_job(job)
 
     def say(self, text: str, timeout: float | None = None,
             on_start=None) -> bool:
-        self._stopped.clear()
+        if not str(text or "").strip():
+            return True
         self._schedule_unload()
         if not self.ensure_started():
             return False
-        with self._lock:
-            engine = self._engine
-        if engine is None:
-            self._last_error = "The Kokoro model was released; please try again."
+        job = self.submit(text, on_start)
+        if job is None:
             return False
-        if self._stopped.is_set():
-            return True
-        chunks = split_for_speech(text)
-        if not chunks:
-            return True
-        return self._say_chunks(engine, chunks, text, timeout, on_start)
+        return self._play_job(job, timeout)
 
-    def _say_chunks(self, engine, chunks, text, timeout, on_start=None) -> bool:
-        """Synthesise ahead while the previous chunk is playing."""
-        started = time.monotonic()
-        speed = max(0.6, min(1.4, 1.0 + (self._rate * 0.04)))
-        ready: queue.Queue = queue.Queue()
-        state = {"error": ""}
+    # -- synthesis threads -------------------------------------------------
+    def _ensure_synth_threads(self) -> None:
+        with self._lock:
+            alive = [t for t in self._synth_threads if t.is_alive()]
+            while len(alive) < SYNTH_WORKERS:
+                thread = threading.Thread(
+                    target=self._synth_worker, name="TALCON-Kokoro-Synth",
+                    daemon=True,
+                )
+                thread.start()
+                alive.append(thread)
+            self._synth_threads = alive
 
-        def produce() -> None:
-            for index, chunk in enumerate(chunks):
-                if self._stopped.is_set():
-                    break
-                if timeout is not None and time.monotonic() - started > timeout:
-                    state["error"] = "Kokoro synthesis took too long."
-                    break
-                item = self._synthesise(engine, chunk, speed, index, len(chunks))
-                if item is None:
-                    break
-                ready.put(item)
-            ready.put(None)
+    def _synth_worker(self) -> None:
+        from .win_threads import lower_current_thread
 
-        producer = threading.Thread(
-            target=produce, name="TALCON-Kokoro-Synth", daemon=True
-        )
-        producer.start()
-        ok = self._play_ready(ready, state, text, on_start)
-        producer.join(timeout=1.0)
-        return ok
+        lower_current_thread()
+        while True:
+            job = self._synth_queue.get()
+            if job is None:
+                return
+            self._synthesise_job(job)
 
-    def _synthesise(self, engine, chunk, speed, index, total):
+    def _synthesise_job(self, job: _SpeechJob) -> None:
+        total = len(job.chunks)
         try:
-            samples, sample_rate = engine.create(
-                chunk, voice=self._voice, speed=speed, lang=self._language
+            for index, chunk in enumerate(job.chunks):
+                if self._interrupted(job):
+                    break
+                item = self._synthesise(
+                    job.engine, chunk, job.speed, index, total,
+                    voice=job.voice, language=job.language, volume=job.volume,
+                )
+                if item is None:
+                    job.error = self._last_error
+                    break
+                pause_after = 0.0
+                if index + 1 < total and _ends_sentence(chunk):
+                    pause_after = self._sentence_pause
+                job.audio.put((item, pause_after))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Kokoro synthesis worker failed")
+            job.error = f"Kokoro synthesis failed: {exc}"
+        finally:
+            job.audio.put(None)
+
+    def _create_audio(self, engine, chunk, speed, voice, language):
+        """Phonemise under a lock, then infer (ONNX inference is thread-safe).
+
+        espeak-ng keeps global state, so phonemisation must never run on two
+        threads at once.  The model itself is happy to serve several calls.
+        """
+        tokenizer = getattr(engine, "tokenizer", None)
+        phonemize = getattr(tokenizer, "phonemize", None)
+        if callable(phonemize):
+            try:
+                with self._phoneme_lock:
+                    phonemes = phonemize(chunk, language)
+            except Exception:
+                phonemes = ""
+            if phonemes:
+                try:
+                    return engine.create(
+                        phonemes, voice=voice, speed=speed,
+                        lang=language, is_phonemes=True,
+                    )
+                except TypeError:
+                    log.debug("kokoro-onnx does not accept pre-phonemised text")
+        with self._phoneme_lock:
+            return engine.create(
+                chunk, voice=voice, speed=speed, lang=language
+            )
+
+    def _synthesise(self, engine, chunk, speed, index, total, voice=None,
+                    language=None, volume=None):
+        try:
+            samples, sample_rate = self._create_audio(
+                engine, chunk, speed,
+                voice or self._voice, language or self._language,
             )
         except Exception as exc:
             log.exception("Kokoro synthesis failed")
             self._last_error = f"Kokoro synthesis failed: {exc}"
             self.on_error(self._last_error)
             return None
-        data = wav_bytes(samples, sample_rate, self._volume / 100.0)
+        gain = self._volume / 100.0 if volume is None else volume
+        data = wav_bytes(samples, sample_rate, gain)
         seconds = len(samples) / float(sample_rate or 1)
-        return (index, data, seconds, total)
+        return (index, data, seconds, total, sample_rate)
 
-    def _play_ready(self, ready, state, text, on_start=None) -> bool:
+    # -- playback ----------------------------------------------------------
+    def _interrupted(self, job: _SpeechJob) -> bool:
+        return (
+            self._closed.is_set()
+            or job.cancel.is_set()
+            or job.epoch != self._epoch
+        )
+
+    def _finish_job(self, job: _SpeechJob) -> bool:
+        """Release one job; True when more speech is already waiting."""
+        with self._outstanding_lock:
+            if not job.finished:
+                job.finished = True
+                self._outstanding = max(0, self._outstanding - 1)
+            return self._outstanding > 0
+
+    def _silence(self, sample_rate: int, seconds: float) -> bytes:
+        """Cached PCM silence, so a pause costs no synthesis time."""
+        rate = int(sample_rate or 24000)
+        millis = int(round(max(0.0, float(seconds)) * 1000))
+        key = (rate, millis)
+        with self._silence_lock:
+            cached = self._silence_cache.get(key)
+            if cached is None:
+                frames = max(0, int(rate * millis / 1000))
+                cached = wav_bytes(
+                    np.zeros(frames, dtype=np.float32), rate
+                )
+                self._silence_cache[key] = cached
+            return cached
+
+    def _play_job(self, job: _SpeechJob, timeout: float | None = None) -> bool:
+        started = time.monotonic()
         spoken = 0.0
         announced = False
+        sample_rate = 0
         while True:
-            item = ready.get()
-            if item is None or self._stopped.is_set():
+            try:
+                item = job.audio.get(timeout=0.2)
+            except queue.Empty:
+                if timeout is not None and time.monotonic() - started > timeout:
+                    job.error = "Kokoro synthesis took too long."
+                    job.cancel.set()
+                    break
+                if self._interrupted(job):
+                    break
+                continue
+            if item is None or self._interrupted(job):
                 break
-            index, data, seconds, total = item
+            (index, data, seconds, total, sample_rate), pause_after = item
+            if timeout is not None and time.monotonic() - started > timeout:
+                job.error = "Kokoro synthesis took too long."
+                job.cancel.set()
+                break
             spoken += seconds
             self._used = {
                 "mode": "kokoro",
-                "voice_id": self._voice,
-                "voice_name": self._voice,
+                "voice_id": job.voice,
+                "voice_name": job.voice,
                 "chunk": index + 1,
                 "chunks": total,
                 "audio_seconds": round(spoken, 2),
             }
-            if not announced and callable(on_start):
+            if not announced and callable(job.on_start):
                 announced = True
                 try:
-                    on_start()
+                    job.on_start()
                 except Exception:
                     log.debug("Playback-start callback failed", exc_info=True)
             if not self._play(data):
-                self._stopped.set()
+                job.cancel.set()
                 break
             self._schedule_unload()
-        if state["error"]:
-            self._last_error = state["error"]
+            if pause_after and not self._interrupted(job):
+                self._play(self._silence(sample_rate, pause_after))
+        more_speech = self._finish_job(job)
+        if (more_speech and sample_rate and not self._interrupted(job)
+                and _ends_sentence(job.text)):
+            # One natural beat at the full stop, with the next sentence
+            # already synthesised and waiting behind it.
+            self._play(self._silence(sample_rate, self._sentence_pause))
+        if job.error:
+            self._last_error = job.error
             self.on_error(self._last_error)
             return False
-        if not self._stopped.is_set():
-            self._last_spoken = str(text)
+        if not self._interrupted(job):
+            self._last_spoken = str(job.text)
         return True
 
     def _play(self, data: bytes) -> bool:

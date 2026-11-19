@@ -130,7 +130,13 @@ class ApplicationPicker(QDialog):
     # -- data --------------------------------------------------------------
     @property
     def selected_app(self) -> dict | None:
-        return dict(self._selected) if self._selected else None
+        if not self._selected:
+            return None
+        # ApplicationLibrary entries are dataclasses; manually browsed files
+        # are stored as plain dicts.  Normalise both to the descriptor shape.
+        if hasattr(self._selected, "to_dict"):
+            return self._selected.to_dict()
+        return dict(self._selected)
 
     def _load_initial(self) -> None:
         if self.library is None:
@@ -236,7 +242,7 @@ class ApplicationPicker(QDialog):
         if key is not None and key in self.existing_keys:
             self._show_error("That application is already in this list.")
             return
-        self._selected = entry
+        self._selected = entry.to_dict() if hasattr(entry, "to_dict") else entry
         self.accept()
 
     # -- messages ----------------------------------------------------------

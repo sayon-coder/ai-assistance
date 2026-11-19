@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 
 from . import neural_tts
-from .neural_tts import model_paths
+from .neural_tts import DEFAULT_SENTENCE_PAUSE, model_paths
 
 log = logging.getLogger("talcon.speech")
 
@@ -231,10 +231,17 @@ class SpeechOutput:
         self._pending_rate = 0
         self._pending_volume = 90
         self._pending_voice = ""
+        self._pending_pause = DEFAULT_SENTENCE_PAUSE
         self._last_reported_error = ""
         self._last_spoken = ""
 
-        self._queue: queue.Queue = queue.Queue(maxsize=16)
+        self._queue: queue.Queue = queue.Queue(maxsize=32)
+        #: Jobs already synthesising, waiting their turn to play.  Keeping one
+        #: or two ahead of playback is what removes the long gap after a
+        #: streamed sentence: the next sentence becomes audio while the
+        #: current one is still being spoken.
+        self._playback: queue.Queue = queue.Queue(maxsize=8)
+        self._player_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._speaking = False
         self._idle = threading.Event()
@@ -339,6 +346,9 @@ class SpeechOutput:
                 try:
                     backend.set_rate(self._pending_rate)
                     backend.set_volume(self._pending_volume)
+                    pause = getattr(backend, "set_sentence_pause", None)
+                    if callable(pause):
+                        pause(self._pending_pause)
                     if self._pending_voice:
                         try:
                             backend.set_voice(self._pending_voice, wait=True)
@@ -494,6 +504,20 @@ class SpeechOutput:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
+        while True:
+            try:
+                entry = self._playback.get_nowait()
+            except queue.Empty:
+                break
+            if entry is None:
+                continue
+            backend, job = entry[0], entry[1]
+            discard = getattr(backend, "discard", None)
+            if callable(discard):
+                try:
+                    discard(job)
+                except Exception:
+                    log.debug("Could not discard queued speech", exc_info=True)
         with self._pending_lock:
             self._pending = 0
 
@@ -506,24 +530,54 @@ class SpeechOutput:
             backend.stop_speaking()
         self._set_speaking(False)
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, announce: bool = True) -> None:
         if not self.enabled or not text:
             return
         full_text = str(text)
         speech_text = spoken_excerpt(humanize_for_speech(full_text))
         if not speech_text:
             return
-        # Count the item before it becomes visible to the worker.  If the count
-        # were incremented after the put, a very fast utterance could finish
-        # first and leave the busy counter stuck above zero forever.
-        with self._pending_lock:
-            self._pending += 1
+        # One sentence per queue item: the pipelined engine then prepares the
+        # next sentence while this one plays, instead of synthesising a whole
+        # paragraph in one blocking call.  Only the first item announces, so
+        # History and the preview still show the complete answer exactly once.
         try:
-            self._queue.put_nowait((speech_text, full_text))
-        except queue.Full:
+            chunks = neural_tts.split_for_speech(speech_text)
+        except Exception:
+            log.debug("Could not split speech into sentences", exc_info=True)
+            chunks = [speech_text]
+        first = True
+        for chunk in chunks or [speech_text]:
+            # Count the item before it becomes visible to the worker.  If the
+            # count were incremented after the put, a very fast utterance could
+            # finish first and leave the busy counter stuck above zero forever.
             with self._pending_lock:
-                self._pending = max(0, self._pending - 1)
-            log.warning("Speech queue full; dropping announcement")
+                self._pending += 1
+            try:
+                self._queue.put_nowait(
+                    (chunk, full_text, bool(announce) and first)
+                )
+            except queue.Full:
+                with self._pending_lock:
+                    self._pending = max(0, self._pending - 1)
+                log.warning("Speech queue full; dropping announcement")
+                continue
+            first = False
+
+    def announce(self, text: str) -> None:
+        """Publish a completed answer to History/preview without speaking it.
+
+        Used when an answer was already spoken sentence by sentence while it
+        streamed in: the transcript must still appear exactly once.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        try:
+            self._on_utterance(text)
+        except Exception:
+            log.exception("Utterance callback failed")
+        self._last_spoken = text
 
     def say_and_wait(self, text: str, timeout: float = 30.0) -> bool:
         """Queue an announcement and block until playback has really finished."""
@@ -591,6 +645,19 @@ class SpeechOutput:
         if backend is not None:
             backend.set_volume(self._pending_volume)
 
+    def set_sentence_pause(self, seconds: float) -> None:
+        """Set the beat of silence TALCON leaves after each full stop."""
+        try:
+            value = max(0.0, min(3.0, float(seconds)))
+        except (TypeError, ValueError):
+            value = DEFAULT_SENTENCE_PAUSE
+        self._pending_pause = value
+        with self._backend_lock:
+            backend = self._backend
+        setter = getattr(backend, "set_sentence_pause", None)
+        if callable(setter):
+            setter(value)
+
     def stop(self) -> None:
         self._stop.set()
         self.clear()
@@ -598,11 +665,98 @@ class SpeechOutput:
             backend = self._backend
         if backend is not None:
             backend.stop()
-        if self._thread.is_alive() and threading.current_thread() is not self._thread:
-            self._thread.join(timeout=2.0)
+        for thread in (self._thread, self._player_thread):
+            if (thread is not None and thread.is_alive()
+                    and threading.current_thread() is not thread):
+                thread.join(timeout=2.0)
         self._set_speaking(False)
 
+    # -- pipelined playback -------------------------------------------------
+    @staticmethod
+    def _pipeline_ready(backend) -> bool:
+        return (
+            bool(getattr(backend, "supports_pipelining", False))
+            and callable(getattr(backend, "submit", None))
+            and callable(getattr(backend, "play", None))
+        )
+
+    def _ensure_player(self) -> None:
+        thread = self._player_thread
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._player, name="TALCON-TTS-Play", daemon=True
+        )
+        self._player_thread = thread
+        thread.start()
+
+    def _player(self) -> None:
+        """Play submitted jobs in order while the feeder keeps synthesising."""
+        while not self._stop.is_set():
+            try:
+                entry = self._playback.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if entry is None:
+                break
+            backend, job, full_text = entry
+            try:
+                play = getattr(backend, "play", None)
+                ok = play(job) if callable(play) else False
+                if ok is False:
+                    self._report_error(
+                        getattr(backend, "last_error", "")
+                        or "Speech synthesis failed."
+                    )
+                else:
+                    self._last_spoken = full_text
+            except Exception as exc:
+                log.exception("Speech playback failed")
+                self._report_error(f"Speech output failed: {exc}")
+            finally:
+                self._finish_item()
+
+    def _finish_item(self) -> None:
+        with self._pending_lock:
+            self._pending = max(0, self._pending - 1)
+            idle = self._pending == 0
+        if idle and self._queue.empty() and self._playback.empty():
+            self._set_speaking(False)
+
+    def _announcer(self, full_text: str):
+        if not full_text:
+            return None
+
+        def announce() -> None:
+            try:
+                self._on_utterance(full_text)
+            except Exception:
+                log.exception("Utterance callback failed")
+
+        return announce
+
+    @staticmethod
+    def _unpack(item):
+        if isinstance(item, tuple):
+            if len(item) >= 3:
+                return item[0], item[1], bool(item[2])
+            speech_text, full_text = item
+            return speech_text, full_text, True
+        # Tolerate a custom queue item for older callers/tests.
+        return item, item, True
+
+    @staticmethod
+    def _say_now(backend, speech_text: str, announce) -> bool:
+        if getattr(backend, "supports_playback_start", False):
+            return backend.say(speech_text, on_start=announce)
+        if callable(announce):
+            announce()
+        return backend.say(speech_text)
+
     def _worker(self) -> None:
+        from .win_threads import lower_current_thread
+
+        lower_current_thread()
         while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=0.3)
@@ -610,27 +764,29 @@ class SpeechOutput:
                 continue
             if item is None:
                 break
-            if isinstance(item, tuple):
-                speech_text, full_text = item
-            else:  # tolerate a custom queue item for older callers/tests
-                speech_text = full_text = item
+            speech_text, full_text, announce_item = self._unpack(item)
+            handled_by_player = False
             try:
                 if not self.enabled:
                     continue
                 self._set_speaking(True)
                 backend = self._ensure_backend()
-
-                def announce() -> None:
-                    try:
-                        self._on_utterance(full_text)
-                    except Exception:
-                        log.exception("Utterance callback failed")
-
-                if getattr(backend, "supports_playback_start", False):
-                    ok = backend.say(speech_text, on_start=announce)
-                else:
-                    announce()
-                    ok = backend.say(speech_text)
+                announce = self._announcer(full_text if announce_item else "")
+                if self._pipeline_ready(backend):
+                    job = backend.submit(speech_text, on_start=announce)
+                    if job is None:
+                        if not self._stop.is_set():
+                            self._report_error(
+                                getattr(backend, "last_error", "")
+                                or "Speech synthesis failed."
+                            )
+                        continue
+                    # The player thread finishes this item, not the worker.
+                    handled_by_player = True
+                    self._ensure_player()
+                    self._playback.put((backend, job, full_text))
+                    continue
+                ok = self._say_now(backend, speech_text, announce)
                 if ok is False:
                     self._report_error(
                         getattr(backend, "last_error", "") or "Speech synthesis failed."
@@ -641,10 +797,8 @@ class SpeechOutput:
                 log.exception("Speech output failed")
                 self._report_error(f"Speech output failed: {exc}")
             finally:
-                with self._pending_lock:
-                    self._pending = max(0, self._pending - 1)
-                if self._queue.empty():
-                    self._set_speaking(False)
+                if not handled_by_player:
+                    self._finish_item()
 
 
 # -- diagnostic ------------------------------------------------------------

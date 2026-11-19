@@ -24,11 +24,12 @@ from .config import (
 )
 from .cron import CronScheduler
 from .custom import ActionExecutor, AutomationRunner, CustomStore
-from .model_setup import download as download_model, model_is_ready, resolve_model
+from .model_setup import download as download_model, download_sherpa
 from .modes import ModeManager
 from .monitors.codex import CodexMonitor
 from .monitors.deepai import DeepAICodeMonitor
 from .monitors.opencode import OpenCodeMonitor
+from .asr import engine_model_ready, engine_reason
 from .pending_actions import PendingActions
 from .running_apps import close_running_app, enumerate_running_apps
 from .speech import (
@@ -275,12 +276,25 @@ class TalconRuntime(QObject):
         if selected in (None, ""):
             return "System default microphone"
         try:
-            for index, name in list_microphones():
+            for index, name in self._cached_microphones():
                 if index == selected:
                     return str(name)
         except Exception:
             log.debug("Could not read the selected microphone name", exc_info=True)
         return f"Microphone device {selected}"
+
+    def _cached_microphones(self) -> list[tuple[int | None, str]]:
+        """Device enumeration costs ~230 ms; the status label asks often."""
+        cached = getattr(self, "_mic_name_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < 60.0:
+            return cached[1]
+        try:
+            names = list_microphones()
+        except Exception:
+            names = []
+        self._mic_name_cache = (now, names)
+        return names
 
     def _record_activity(self, text: str) -> None:
         text = str(text or "").strip()
@@ -419,6 +433,11 @@ class TalconRuntime(QObject):
         self._start_deepai()
         self.cron.start()
         self._set_status("cron", self.cron.status_text())
+        # Bring a stopped local AI gateway up in the background so the first
+        # spoken question does not pay the 15-25 s start-up cost.
+        threading.Thread(
+            target=self._prewarm_ai_backend, name="TALCON-AI-Warm", daemon=True
+        ).start()
         # Discover installed applications off the UI/voice thread.  The
         # catalogue is cached and only rebuilt on demand or when it goes stale.
         self.apps.refresh_async(self._on_apps_discovered)
@@ -494,7 +513,18 @@ class TalconRuntime(QObject):
 
         self.speech.set_rate(int(self.settings.get("speech_rate", 0)))
         self.speech.set_volume(int(self.settings.get("speech_volume", 90)))
+        self._apply_sentence_pause(self.settings)
         self._publish_speech_state(info, note, confirmed)
+
+    def _apply_sentence_pause(self, settings: dict) -> None:
+        """Apply the beat of silence after each full stop, when supported."""
+        setter = getattr(self.speech, "set_sentence_pause", None)
+        if not callable(setter):
+            return
+        try:
+            setter(float(settings.get("speech_sentence_pause", 1.0)))
+        except (TypeError, ValueError):
+            setter(1.0)
 
     def _publish_speech_state(self, info: dict, note: str = "", confirmed: str = "") -> None:
         self._speech_note = str(note or "")
@@ -532,12 +562,12 @@ class TalconRuntime(QObject):
             self._set_status("voice", "Listening stopped")
             self._set_status("wake", "Listening stopped")
             return
-        model = resolve_model(self.settings.get("vosk_model_path"))
-        if not model_is_ready(model):
+        if not engine_model_ready(self.settings):
             self._set_status("voice", "Speech model missing · download it in Voice settings")
             self._set_status("wake", "Speech model missing")
-            log.info("Wake word not started: Vosk model missing at %s", model)
+            log.info("Wake word not started: %s", engine_reason(self.settings))
             return
+        log.info("Speech recognition: %s", engine_reason(self.settings))
         self.voice = VoiceController(
             self.settings, self.commands, self._voice_status, self._set_face,
             event_callback=self._voice_event,
@@ -802,25 +832,77 @@ class TalconRuntime(QObject):
             # wipes the request context immediately.
             self.assistant.cancel()
             self.assistant.clear_context()
+        elif self.settings.get("ai_autostart_backend", True):
+            # Enabling AI with a stopped gateway should not cost the first
+            # question a 20-second wait.
+            threading.Thread(
+                target=self._prewarm_ai_backend,
+                name="TALCON-AI-Warm", daemon=True,
+            ).start()
         self.bridge.settings_changed.emit(dict(self.settings))
         self._set_status("assistant", "Idle")
         log.info("AI assistant %s", "enabled" if enabled else "disabled")
 
-    def assistant_backend_status(self) -> str:
+    def assistant_backend_status(self, start_if_down: bool = False) -> str:
+        """A short state code the UI can turn into a sentence."""
         if not self.settings.get("ai_enabled", False):
             return "off"
+        report = self.ai_backend_report(start_if_down=start_if_down)
+        if report.get("reachable"):
+            return "ready"
+        if report.get("installed"):
+            return "stopped"
+        return "unconfigured"
+
+    def ai_backend_report(self, start_if_down: bool = False) -> dict:
+        """The real state of the loopback Hermes API, never a guess."""
         try:
-            self.assistant._get_client()
+            from .hermes_service import probe
+
+            return probe(
+                str(self.settings.get("hermes_host", "127.0.0.1")),
+                int(self.settings.get("hermes_port", 8642) or 8642),
+                start_if_down=bool(start_if_down),
+                on_progress=lambda text: self._set_status("assistant", text),
+            )
         except Exception:
-            return "unconfigured"
-        client = getattr(self.assistant, "_client", None)
-        if client is None:
-            return "unconfigured"
+            log.exception("Could not probe the local AI backend")
+            return {
+                "installed": False, "listening": False, "reachable": False,
+                "detail": "The local AI backend could not be checked.",
+            }
+
+    def start_ai_backend(self, wait_seconds: float = 40.0) -> tuple[bool, str]:
+        """Start the installed Hermes gateway and wait for its API port."""
         try:
-            health = client.health()
+            from .hermes_service import ensure_running
+
+            return ensure_running(
+                str(self.settings.get("hermes_host", "127.0.0.1")),
+                int(self.settings.get("hermes_port", 8642) or 8642),
+                autostart=True,
+                wait_seconds=wait_seconds,
+            )
+        except Exception as exc:
+            log.exception("Could not start the local AI gateway")
+            return False, str(exc)
+
+    def _prewarm_ai_backend(self) -> None:
+        """Start a stopped gateway a few seconds after login, not during it."""
+        if not (self.settings.get("ai_enabled", False)
+                and self.settings.get("ai_autostart_backend", True)):
+            return
+        time.sleep(3.0)
+        try:
+            from .hermes_service import installed, is_listening, start_gateway
+
+            host = str(self.settings.get("hermes_host", "127.0.0.1"))
+            port = int(self.settings.get("hermes_port", 8642) or 8642)
+            if installed() and not is_listening(host, port):
+                started, detail = start_gateway(host=host, port=port)
+                log.info("Local AI gateway pre-warm: %s (%s)", started, detail)
         except Exception:
-            return "unreachable"
-        return "ready" if health.get("status") == "ok" else "unreachable"
+            log.debug("Could not pre-warm the local AI gateway", exc_info=True)
 
     def ai_cache_stats(self) -> dict:
         """Counters for the in-memory response cache (never persisted)."""
@@ -919,7 +1001,7 @@ class TalconRuntime(QObject):
         self.bridge.settings_changed.emit(dict(self.settings))
 
     def listen_now(self) -> None:
-        if not model_is_ready(resolve_model(self.settings.get("vosk_model_path"))):
+        if not engine_model_ready(self.settings):
             self._set_status("wake", "Speech model missing")
             return
         if self.voice is None:
@@ -1049,12 +1131,21 @@ class TalconRuntime(QObject):
 
         def work() -> None:
             try:
-                path = download_model(progress)
-                try:
-                    stored = str(path.relative_to(ROOT))
-                except ValueError:
-                    stored = str(path)
-                self.settings["vosk_model_path"] = stored
+                wanted = str(self.settings.get("asr_engine") or "auto").lower()
+                if wanted == "sherpa":
+                    path = download_sherpa(progress)
+                    try:
+                        stored = str(path.relative_to(ROOT))
+                    except ValueError:
+                        stored = str(path)
+                    self.settings["sherpa_model_path"] = stored
+                else:
+                    path = download_model(progress)
+                    try:
+                        stored = str(path.relative_to(ROOT))
+                    except ValueError:
+                        stored = str(path)
+                    self.settings["vosk_model_path"] = stored
                 self.settings = persist_settings(self.settings)
                 self.bridge.model_progress.emit(100, "Speech model installed. Starting the listener…")
                 self._start_voice()
@@ -1351,13 +1442,19 @@ class TalconRuntime(QObject):
             self._set_status("speech", self._speech_status_text())
         self.speech.set_rate(int(normalized.get("speech_rate", 0)))
         self.speech.set_volume(int(normalized.get("speech_volume", 90)))
+        self._apply_sentence_pause(normalized)
 
-        voice_keys = {"vosk_model_path", "microphone_device", "wake_enabled", "always_listen"}
+        voice_keys = {
+            "vosk_model_path", "sherpa_model_path", "asr_engine",
+            "microphone_device", "wake_enabled", "always_listen",
+        }
         speech_keys = {
             "speech_start_timeout", "speech_trailing_silence",
             "speech_max_utterance", "speech_min_confidence",
             "speech_alt_min_confidence", "speech_endpointer_mode",
-            "vad_noise_floor",
+            "vad_noise_floor", "audio_agc", "audio_noise_suppression",
+            "audio_aec", "audio_agc_target_rms",
+            "long_question_whisper", "whisper_model",
         }
         if any(old.get(key) != normalized.get(key) for key in voice_keys):
             self._start_voice()

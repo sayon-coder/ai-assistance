@@ -18,6 +18,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from .config import ASSETS_DIR, ROOT
@@ -66,6 +68,12 @@ def launch_command() -> tuple[Path, str]:
 # ---------------------------------------------------------------------------
 # state
 # ---------------------------------------------------------------------------
+#: Cached result of the slow ``schtasks.exe`` probe (link/registry hit first).
+_CACHE_LOCK = threading.Lock()
+_CACHE: tuple[float, bool] | None = None
+CACHE_SECONDS = 5.0
+
+
 def scheduled_task_exists() -> bool:
     try:
         result = subprocess.run(
@@ -97,18 +105,48 @@ def run_key_exists() -> bool:
     return bool(run_key_value())
 
 
-def is_enabled() -> bool:
-    return (
-        shortcut_path().exists()
-        or legacy_shortcut_path().exists()
-        or run_key_exists()
-        or scheduled_task_exists()
-    )
+def is_enabled(use_cache: bool = True) -> bool:
+    """True when TALCON starts with Windows.
+
+    The Startup-folder shortcut and the HKCU Run value are cheap to read.  Only
+    ``schtasks.exe`` costs ~90 ms (it spawns a process), so its answer is
+    cached briefly: the window calls this on every show and the tray menu on
+    every status change.
+    """
+    if shortcut_path().exists() or legacy_shortcut_path().exists():
+        return True
+    if run_key_exists():
+        return True
+    if not use_cache:
+        value = scheduled_task_exists()
+        _store_cache(value)
+        return value
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        cached = _CACHE
+        if cached is not None and now - cached[0] < CACHE_SECONDS:
+            return cached[1]
+    value = scheduled_task_exists()
+    _store_cache(value)
+    return value
+
+
+def _store_cache(value: bool) -> None:
+    global _CACHE
+    with _CACHE_LOCK:
+        _CACHE = (time.monotonic(), bool(value))
+
+
+def invalidate_cache() -> None:
+    """Forget the cached startup state (after an enable/disable)."""
+    global _CACHE
+    with _CACHE_LOCK:
+        _CACHE = None
 
 
 def is_current() -> bool:
     """True when a reliable autostart mechanism is present."""
-    return run_key_exists() or shortcut_path().exists() or scheduled_task_exists()
+    return is_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +361,13 @@ def ensure() -> tuple[bool, str]:
 
 def enable() -> tuple[bool, str]:
     try:
+        return _enable()
+    finally:
+        invalidate_cache()
+
+
+def _enable() -> tuple[bool, str]:
+    try:
         _clear_startup_approval()
         _write_launcher()
         task_ok, task_detail = _create_scheduled_task()
@@ -364,6 +409,13 @@ def enable() -> tuple[bool, str]:
 
 
 def disable() -> tuple[bool, str]:
+    try:
+        return _disable()
+    finally:
+        invalidate_cache()
+
+
+def _disable() -> tuple[bool, str]:
     try:
         _delete_scheduled_task()
         _delete_run_value()

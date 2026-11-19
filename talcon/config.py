@@ -21,7 +21,7 @@ from .apps import normalize_app_entry
 
 log = logging.getLogger("talcon.config")
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 APP_NAME = "TALCON"
 
 
@@ -44,15 +44,35 @@ def _app_root() -> Path:
 
 ROOT = _app_root()
 
-# If the install folder cannot be written to, keep user data in LOCALAPPDATA.
-_DATA_ROOT = ROOT
-if not _writable(ROOT):
-    _DATA_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / APP_NAME
+
+def _preferred_data_root() -> Path:
+    """Mutable user data lives outside the project folder (and OneDrive).
+
+    Keeping settings, logs and cron history beside the source made every save
+    race OneDrive's sync client, which could lock the file for a moment and
+    stall the UI.  ``%LOCALAPPDATA%\\TALCON`` is local, always writable and is
+    what a normal Windows application uses.
+    """
+    override = os.environ.get("TALCON_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / APP_NAME
+    return Path(tempfile.gettempdir()) / APP_NAME
+
+
+_DATA_ROOT = _preferred_data_root()
+try:
     _DATA_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _DATA_ROOT = ROOT
 
 CONFIG_DIR = _DATA_ROOT / "config"
 LOGS_DIR = _DATA_ROOT / "logs"
-MODELS_DIR = _DATA_ROOT / "models"
+# Models are large and read-only; keep them beside the application when it is
+# writable, otherwise use the local data folder (e.g. Program Files installs).
+MODELS_DIR = (ROOT / "models") if _writable(ROOT) else (_DATA_ROOT / "models")
 ASSETS_DIR = ROOT / "assets"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 MODES_PATH = CONFIG_DIR / "modes.json"
@@ -64,6 +84,37 @@ for _folder in (CONFIG_DIR, LOGS_DIR, MODELS_DIR):
     except OSError:
         log.warning("Could not create %s", _folder)
 
+#: Files moved out of the project folder the first time this version runs.
+_LEGACY_FILES = (
+    "settings.json", "modes.json", "custom_commands.json",
+    "cron_jobs.json", "app_aliases.json",
+)
+
+
+def migrate_legacy_data() -> None:
+    """Copy small user files from ``<project>/config`` exactly once.
+
+    Older builds kept settings inside the source tree.  Moving them keeps the
+    user's face position, modes and schedules without touching the (large)
+    model download.
+    """
+    legacy_dir = ROOT / "config"
+    try:
+        if legacy_dir.resolve() == CONFIG_DIR.resolve():
+            return
+    except OSError:
+        return
+    for name in _LEGACY_FILES:
+        source = legacy_dir / name
+        target = CONFIG_DIR / name
+        if not source.is_file() or target.exists():
+            continue
+        try:
+            target.write_bytes(source.read_bytes())
+            log.info("Migrated %s to %s", name, CONFIG_DIR)
+        except OSError:
+            log.warning("Could not migrate %s", name, exc_info=True)
+
 DEFAULT_SETTINGS: dict = {
     "schema_version": 2,
     "setup_complete": False,
@@ -73,16 +124,29 @@ DEFAULT_SETTINGS: dict = {
     "always_listen": True,
     "phrase_timeout": 4.0,
     "vosk_model_path": "models/vosk-model-small-en-us-0.15",
+    # "auto" prefers sherpa-onnx when its package and model are installed and
+    # otherwise uses Vosk.  An explicit "sherpa" also falls back safely.
+    "asr_engine": "auto",
+    "sherpa_model_path": "models/sherpa-onnx-streaming-zipformer-en-2023-06-26",
     "microphone_device": None,
     # Recognition timing and confidence.  The trailing-silence window is
     # deliberately longer than the old fixed 1.1 s so slow speech survives.
     "speech_start_timeout": 7.0,
-    "speech_trailing_silence": 1.6,
+    "speech_trailing_silence": 1.0,
     "speech_max_utterance": 20.0,
     "speech_min_confidence": 0.30,
     "speech_alt_min_confidence": 0.55,
     "speech_endpointer_mode": "long",
     "vad_noise_floor": 0.0,
+    # Audio conditioning shared by every recognition engine.  The VAD keeps
+    # measuring the raw microphone level; only the recogniser sees this.
+    "audio_agc": True,
+    "audio_noise_suppression": True,
+    "audio_aec": False,
+    "audio_agc_target_rms": 1800.0,
+    # Optional slower second pass for genuinely long questions only.
+    "long_question_whisper": False,
+    "whisper_model": "small.en",
     # Voice output
     "voice_enabled": True,
     # Stop taking commands (voice replies still work) until "take command".
@@ -98,6 +162,10 @@ DEFAULT_SETTINGS: dict = {
     "ai_cache_ttl_seconds": 600,
     # Seconds one AI request may take before TALCON stops it and says so.
     "ai_timeout_seconds": 75,
+    # Start the installed Hermes gateway automatically when it is not running,
+    # and speak streamed sentences instead of waiting for the full answer.
+    "ai_autostart_backend": True,
+    "ai_streaming": True,
     # Voice conversations need a prompt answer.  Hermes agent runs use an SSE
     # tool-workflow which is useful for explicit automation, but can remain
     # open without a final answer.  Use the normal chat endpoint by default.
@@ -108,6 +176,10 @@ DEFAULT_SETTINGS: dict = {
     "speech_voice_ids": {},
     "speech_rate": 0,
     "speech_volume": 90,
+    # Silence after each full stop while an answer is being spoken.  Synthesis
+    # runs ahead of playback, so this is the beat the listener actually hears
+    # between sentences (one second is a calm, natural pace).
+    "speech_sentence_pause": 1.0,
     # Face
     "show_face": True,
     "face_size": 66,
@@ -117,6 +189,12 @@ DEFAULT_SETTINGS: dict = {
     "face_x": None,
     "face_y": None,
     "face_screen": "",
+    # Control-center window geometry and last page (restored at launch).
+    "window_width": 1060,
+    "window_height": 740,
+    "window_x": None,
+    "window_y": None,
+    "window_page": "dashboard",
     # Menu bar face (Windhawk macOS-style bar)
     "menu_bar_face_enabled": True,
     "menu_bar_face_size": 18,
@@ -214,18 +292,14 @@ def _write_json_unlocked(path: Path, data) -> None:
             json.dump(data, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
             handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
         last_error: OSError | None = None
         for attempt in range(6):
             try:
                 temp.replace(path)
                 return
-            except OSError as exc:  # OneDrive / antivirus can briefly lock it
+            except OSError as exc:  # antivirus can briefly lock it
                 last_error = exc
-                time.sleep(0.1 * (attempt + 1))
+                time.sleep(0.05 * (attempt + 1))
         raise last_error if last_error else OSError(f"Could not write {path}")
     finally:
         try:
@@ -234,9 +308,22 @@ def _write_json_unlocked(path: Path, data) -> None:
             pass
 
 
+#: Last payload written per path, so a no-op save does not touch the disk.
+_LAST_WRITTEN: dict[str, str] = {}
+
+
 def write_json(path: Path, data) -> None:
+    path = Path(path)
+    try:
+        signature = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        signature = ""
     with _WRITE_LOCK:
-        _write_json_unlocked(Path(path), data)
+        if signature and _LAST_WRITTEN.get(str(path)) == signature:
+            return
+        _write_json_unlocked(path, data)
+        if signature:
+            _LAST_WRITTEN[str(path)] = signature
 
 
 def _read_json(path: Path, fallback: dict) -> dict:
@@ -292,6 +379,14 @@ def normalize_settings(raw: dict) -> dict:
 
     merged["speech_backend"] = normalize_backend(merged.get("speech_backend"))
     merged["speech_voice"] = str(merged.get("speech_voice") or "").strip()
+    from .asr.registry import normalize_engine
+
+    merged["asr_engine"] = normalize_engine(merged.get("asr_engine"))
+    merged["sherpa_model_path"] = str(
+        merged.get("sherpa_model_path")
+        or "models/sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    ).strip()
+    merged["whisper_model"] = str(merged.get("whisper_model") or "small.en").strip()
     merged["speech_voice_id"] = str(merged.get("speech_voice_id") or "").strip()
     # One engine means one saved voice.  Older settings may contain Windows
     # engine keys; they are dropped rather than carried forward.
@@ -300,13 +395,18 @@ def normalize_settings(raw: dict) -> dict:
         raw_voice_ids = {}
     kokoro_voice = str(raw_voice_ids.get("kokoro") or "").strip()
     merged["speech_voice_ids"] = {"kokoro": kokoro_voice} if kokoro_voice else {}
-    for key in ("face_x", "face_y"):
+    for key in ("face_x", "face_y", "window_x", "window_y"):
         value = merged.get(key)
         if value is not None:
             try:
                 merged[key] = int(value)
             except (TypeError, ValueError):
                 merged[key] = None
+    merged["window_width"] = _clamp(merged.get("window_width"), 720, 10000, 1060)
+    merged["window_height"] = _clamp(merged.get("window_height"), 520, 10000, 740)
+    merged["window_page"] = (
+        str(merged.get("window_page") or "dashboard").strip() or "dashboard"
+    )
     merged["face_sleepy_after"] = _clamp(
         merged.get("face_sleepy_after"), 20, 1800, 90
     )
@@ -345,6 +445,9 @@ def normalize_settings(raw: dict) -> dict:
         "announce_interruptions", "start_with_windows", "setup_complete",
         "menu_bar_face_enabled", "menu_bar_face_animate", "commands_paused",
         "ai_enabled", "ai_cache_enabled", "ai_use_agent_runs",
+        "ai_autostart_backend", "ai_streaming",
+        "audio_agc", "audio_noise_suppression", "audio_aec",
+        "long_question_whisper",
     ):
         merged[key] = bool(merged.get(key))
     merged["hermes_host"] = str(merged.get("hermes_host") or "127.0.0.1").strip()
@@ -375,11 +478,13 @@ def normalize_settings(raw: dict) -> dict:
         merged["phrase_timeout"] = 4.0
     for key, low, high, default in (
         ("speech_start_timeout", 2.0, 15.0, 7.0),
-        ("speech_trailing_silence", 0.6, 4.0, 1.6),
+        ("speech_trailing_silence", 0.6, 4.0, 1.0),
         ("speech_max_utterance", 6.0, 45.0, 20.0),
         ("speech_min_confidence", 0.0, 1.0, 0.30),
         ("speech_alt_min_confidence", 0.0, 1.0, 0.55),
+        ("speech_sentence_pause", 0.0, 3.0, 1.0),
         ("vad_noise_floor", 0.0, 5000.0, 0.0),
+        ("audio_agc_target_rms", 300.0, 6000.0, 1800.0),
     ):
         try:
             merged[key] = max(low, min(high, float(merged.get(key, default))))

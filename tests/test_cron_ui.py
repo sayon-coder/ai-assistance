@@ -71,6 +71,42 @@ def test_authorized_job_is_saved_with_a_canonical_app(qapp, tmp_path):
         page.deleteLater()
 
 
+def test_choose_application_uses_the_picker_descriptor(qapp, tmp_path, monkeypatch):
+    from talcon.ui import cron_jobs as cron_ui
+
+    selected = AppEntry(
+        name="Google Chrome", kind="shortcut",
+        path="C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk",
+    ).to_dict()
+
+    class FakePicker:
+        DialogCode = SimpleNamespace(Accepted=1)
+
+        def __init__(self, runtime, parent=None):
+            pass
+
+        def exec(self):
+            return self.DialogCode.Accepted
+
+        @property
+        def selected_app(self):
+            return dict(selected)
+
+    monkeypatch.setattr(cron_ui, "ApplicationPicker", FakePicker)
+    runtime = FakeRuntime(tmp_path)
+    page = CronJobsPage(runtime)
+    try:
+        page.action_combo.setCurrentIndex(page.action_combo.findData("open_app"))
+        page._choose_app()
+        assert page.app_name.text() == "Google Chrome"
+        page.name_input.setText("Browser via picker")
+        page._save()
+        assert runtime.store.snapshot()[0]["action"]["app"]["name"] == "Google Chrome"
+        assert page.error_label.isVisible() is False
+    finally:
+        page.deleteLater()
+
+
 def test_pause_button_changes_persisted_state(qapp, tmp_path):
     runtime = FakeRuntime(tmp_path)
     page = CronJobsPage(runtime)

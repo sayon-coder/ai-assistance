@@ -7,18 +7,26 @@ import os
 import subprocess
 import threading
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSizeGrip, QSlider, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QButtonGroup, QComboBox, QDoubleSpinBox, QFrame, QGraphicsDropShadowEffect,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QSizeGrip, QSlider, QSpinBox, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from .. import startup
+from ..asr import (
+    ENGINE_CHOICES,
+    ENGINE_LABELS,
+    engine_model_ready,
+    engine_reason,
+)
 from ..config import BUILTIN_MODES, LOGS_DIR, MODELS_DIR, RESERVED_MODE_KEYS, ROOT
 from ..face_render import render_face_image
-from ..model_setup import MODEL_LICENSE, model_is_ready, resolve_model
 from ..runtime import TalconRuntime
 from ..speech import BACKEND_AUTO, SPEECH_BACKEND_OPTIONS
 from ..audio import calibrate_microphone
@@ -88,23 +96,81 @@ class MainWindow(QWidget):
         self.setObjectName("Root")
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(theme.STYLESHEET)
+        # Let the desktop show through the rounded corners instead of painting
+        # an opaque square behind the shell.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMinimumSize(980, 660)
         self.resize(1060, 740)
+        self._current_page = self._initial_page()
         self._build()
+        self._restore_geometry()
+        self._install_shortcuts()
         self._connect()
         self.load_from_runtime()
         self.update_statuses(self.runtime.status_snapshot())
         self._center_on_screen()
 
     # =====================================================================
+    # window state
+    # =====================================================================
+    def _initial_page(self) -> str:
+        known = {key for key, _label in PAGES}
+        page = str(self.runtime.settings.get("window_page") or "dashboard")
+        return page if page in known else "dashboard"
+
+    def _restore_geometry(self) -> None:
+        """Reopen at the size and place the user left it, if still on screen."""
+        s = self.runtime.settings
+        width = int(s.get("window_width", 1060) or 1060)
+        height = int(s.get("window_height", 740) or 740)
+        x = s.get("window_x")
+        y = s.get("window_y")
+        if not isinstance(x, int) or not isinstance(y, int):
+            return
+        rect = QRect(x, y, width, height)
+        for screen in QGuiApplication.screens():
+            if screen.availableGeometry().intersects(rect):
+                self.setGeometry(rect)
+                return
+
+    def _remember_geometry(self) -> None:
+        geometry = self.geometry()
+        values = {
+            "window_width": max(720, geometry.width()),
+            "window_height": max(520, geometry.height()),
+            "window_x": geometry.x(),
+            "window_y": geometry.y(),
+            "window_page": str(self._current_page or "dashboard"),
+        }
+        if values == {key: self.runtime.settings.get(key) for key in values}:
+            return
+        try:
+            self.runtime.save_settings(values)
+        except Exception:
+            log.debug("Could not save the window geometry", exc_info=True)
+
+    def _install_shortcuts(self) -> None:
+        """Ctrl+1…Ctrl+9 jump to a section; Esc returns to the tray."""
+        for index, (key, label) in enumerate(PAGES[:9], start=1):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index}"), self)
+            shortcut.activated.connect(lambda k=key: self.show_page(k))
+            shortcut.setWhatsThis(f"Open {label}")
+        escape = QShortcut(QKeySequence("Escape"), self)
+        escape.activated.connect(self.runtime.hide_to_tray)
+
+    # =====================================================================
     # construction
     # =====================================================================
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setContentsMargins(22, 22, 22, 22)
         shell = QFrame()
         shell.setObjectName("Shell")
+        shadow = QGraphicsDropShadowEffect(shell)
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QColor(0, 0, 0, 75))
+        shell.setGraphicsEffect(shadow)
         outer.addWidget(shell)
 
         shell_layout = QVBoxLayout(shell)
@@ -149,7 +215,7 @@ class MainWindow(QWidget):
             self.stack.addWidget(self.pages[key])
         self._sync_custom_mode_pages()
         self._populate_nav()
-        self.show_page("dashboard")
+        self.show_page(self._current_page)
 
         self.size_grip = QSizeGrip(self)
         self.size_grip.setFixedSize(16, 16)
@@ -300,6 +366,28 @@ class MainWindow(QWidget):
         greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 18 else "Good evening")
         layout.addWidget(Heading("Dashboard", f"{greeting}, sir. TALCON is running quietly in the background."))
 
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        self.dash_listen = QPushButton("Listen now")
+        self.dash_listen.setObjectName("Primary")
+        self.dash_listen.clicked.connect(self.runtime.listen_now)
+        self.dash_mute = QPushButton("Mute voice")
+        self.dash_mute.setObjectName("Ghost")
+        self.dash_mute.clicked.connect(
+            lambda: self.runtime.set_muted(not self.runtime.muted)
+        )
+        voice_button = QPushButton("Voice settings")
+        voice_button.setObjectName("Ghost")
+        voice_button.clicked.connect(lambda: self.show_page("voice"))
+        commands_button = QPushButton("Recent commands")
+        commands_button.setObjectName("Ghost")
+        commands_button.clicked.connect(lambda: self.show_page("commands"))
+        for widget in (self.dash_listen, self.dash_mute,
+                       voice_button, commands_button):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
         grid = QGridLayout()
         grid.setSpacing(12)
         self.stat_widgets: dict[str, StatusText] = {}
@@ -320,7 +408,7 @@ class MainWindow(QWidget):
         recent = Card("Recent activity")
         self.activity_label = QLabel("No activity yet.")
         self.activity_label.setWordWrap(True)
-        self.activity_label.setStyleSheet("font-size: 9.5pt; color: #D8D8D8;")
+        self.activity_label.setStyleSheet("font-size: 9.5pt; color: #3A3A3A;")
         recent.add(self.activity_label)
         self.last_event = QLabel("TALCON is ready.")
         self.last_event.setWordWrap(True)
@@ -538,6 +626,24 @@ class MainWindow(QWidget):
         volume_row.addWidget(self.volume_slider, 1)
         volume_row.addWidget(self.volume_label)
         output.add_layout(volume_row)
+
+        pause_row = QHBoxLayout()
+        pause_row.addWidget(QLabel("Pause after a full stop"))
+        self.pause_slider = QSlider(Qt.Orientation.Horizontal)
+        # Stored in tenths of a second (0-3 s); one second is the default beat.
+        self.pause_slider.setRange(0, 30)
+        self.pause_slider.setMinimumWidth(220)
+        self.pause_slider.valueChanged.connect(self._on_pause_changed)
+        self.pause_slider.sliderReleased.connect(self._save_pause)
+        self.pause_slider.valueChanged.connect(
+            lambda _v: self._debounced_save("pause", self._save_pause)
+        )
+        self.pause_label = QLabel("1.0 s")
+        self.pause_label.setObjectName("Muted")
+        self.pause_label.setFixedWidth(70)
+        pause_row.addWidget(self.pause_slider, 1)
+        pause_row.addWidget(self.pause_label)
+        output.add_layout(pause_row)
         output.add(footnote(
             "Muting stops speech only. Wake-word listening and application monitoring keep running."
         ))
@@ -583,6 +689,32 @@ class MainWindow(QWidget):
         self.always_switch = Switch()
         always_row.addWidget(self.always_switch)
         wake.add_layout(always_row)
+
+        asr_row = QHBoxLayout()
+        asr_row.addWidget(QLabel("Recognition engine"))
+        self.asr_engine_combo = QComboBox()
+        self.asr_engine_combo.setMinimumWidth(300)
+        for key in ENGINE_CHOICES:
+            self.asr_engine_combo.addItem(ENGINE_LABELS[key], key)
+        asr_row.addWidget(self.asr_engine_combo, 1)
+        wake.add_layout(asr_row)
+        self.asr_status = StatusText("Checking recognition engine…")
+        wake.add(self.asr_status)
+
+        frontend = QGridLayout()
+        frontend.setHorizontalSpacing(18)
+        frontend.setVerticalSpacing(6)
+        self.agc_switch = Switch()
+        self.noise_switch = Switch()
+        self.aec_switch = Switch()
+        frontend.addWidget(QLabel("Automatic gain (AGC)"), 0, 0)
+        frontend.addWidget(self.agc_switch, 0, 1)
+        frontend.addWidget(QLabel("Noise suppression"), 0, 2)
+        frontend.addWidget(self.noise_switch, 0, 3)
+        frontend.addWidget(QLabel("Echo suppression (requires playback tap)"), 1, 0)
+        frontend.addWidget(self.aec_switch, 1, 1)
+        wake.add_layout(frontend)
+
         self.voice_status = StatusText("Starting…")
         wake.add(self.voice_status)
 
@@ -738,13 +870,68 @@ class MainWindow(QWidget):
         self.ai_switch = Switch()
         ai_row.addWidget(self.ai_switch)
         ai.add_layout(ai_row)
+
+        ai.add(muted(
+            "If Hermes is installed but its gateway is not running, TALCON "
+            "starts it automatically. Everything stays on this PC."
+        ))
+        endpoint = QGridLayout()
+        endpoint.setHorizontalSpacing(12)
+        endpoint.setVerticalSpacing(6)
+        self.ai_host = QLineEdit()
+        self.ai_host.setPlaceholderText("127.0.0.1")
+        self.ai_port = QSpinBox()
+        self.ai_port.setRange(1, 65535)
+        self.ai_model = QLineEdit()
+        self.ai_model.setPlaceholderText("hermes-agent")
+        endpoint.addWidget(QLabel("Host"), 0, 0)
+        endpoint.addWidget(self.ai_host, 0, 1)
+        endpoint.addWidget(QLabel("Port"), 0, 2)
+        endpoint.addWidget(self.ai_port, 0, 3)
+        endpoint.addWidget(QLabel("Model"), 1, 0)
+        endpoint.addWidget(self.ai_model, 1, 1, 1, 3)
+        ai.add_layout(endpoint)
+
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(QLabel("Start the gateway automatically"))
+        auto_row.addStretch(1)
+        self.ai_autostart_switch = Switch()
+        auto_row.addWidget(self.ai_autostart_switch)
+        ai.add_layout(auto_row)
+
+        stream_row = QHBoxLayout()
+        stream_row.addWidget(QLabel("Speak while the answer streams in"))
+        stream_row.addStretch(1)
+        self.ai_stream_switch = Switch()
+        stream_row.addWidget(self.ai_stream_switch)
+        ai.add_layout(stream_row)
         ai_status_row = QHBoxLayout()
         self.ai_status = StatusText("AI is off — TALCON answers with local commands only.")
         ai_status_row.addWidget(self.ai_status, 1)
-        self.ai_check_button = QPushButton("Check connection")
+        self.ai_start_button = QPushButton("Start Hermes")
+        self.ai_start_button.setToolTip(
+            "Start the Hermes gateway installed on this PC and wait for its API."
+        )
+        self.ai_start_button.clicked.connect(self._start_ai_backend)
+        ai_status_row.addWidget(self.ai_start_button)
+        self.ai_check_button = QPushButton("Test connection")
         self.ai_check_button.clicked.connect(self._check_ai_backend)
         ai_status_row.addWidget(self.ai_check_button)
         ai.add_layout(ai_status_row)
+
+        ai_actions = QHBoxLayout()
+        save_backend = QPushButton("Save AI address")
+        save_backend.clicked.connect(self._save_ai_backend)
+        ai_actions.addWidget(save_backend)
+        ai_actions.addStretch(1)
+        self.ai_detail = QLabel("")
+        self.ai_detail.setObjectName("Footnote")
+        self.ai_detail.setWordWrap(True)
+        self.ai_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        ai.add_layout(ai_actions)
+        ai.add(self.ai_detail)
         ai.add(footnote(
             "TALCON only ever talks to the Hermes server on 127.0.0.1, uses the "
             "API key already in your local Hermes configuration, and keeps AI "
@@ -1118,9 +1305,25 @@ class MainWindow(QWidget):
 
         self.speech_switch.toggled.connect(lambda checked: self.runtime.set_muted(not checked))
         self.ai_switch.toggled.connect(self.runtime.set_ai_enabled)
+        self.ai_autostart_switch.toggled.connect(
+            lambda checked: self._save({"ai_autostart_backend": bool(checked)})
+        )
+        self.ai_stream_switch.toggled.connect(
+            lambda checked: self._save({"ai_streaming": bool(checked)})
+        )
         self.wake_switch.toggled.connect(self.runtime.set_wake_enabled)
         self.always_switch.toggled.connect(
             lambda checked: self._save({"always_listen": bool(checked)})
+        )
+        self.asr_engine_combo.currentIndexChanged.connect(self._on_asr_engine_chosen)
+        self.agc_switch.toggled.connect(
+            lambda checked: self._save_audio_frontend()
+        )
+        self.noise_switch.toggled.connect(
+            lambda checked: self._save_audio_frontend()
+        )
+        self.aec_switch.toggled.connect(
+            lambda checked: self._save_audio_frontend()
         )
         self.deepai_switch.toggled.connect(
             lambda checked: self._save({"deepai_enabled": checked})
@@ -1142,7 +1345,7 @@ class MainWindow(QWidget):
         self.mic_combo.currentIndexChanged.connect(self._on_mic_chosen)
 
         bridge = self.runtime.bridge
-        bridge.status_changed.connect(self.update_statuses)
+        bridge.status_changed.connect(self._queue_status)
         bridge.speech_voices_changed.connect(self._populate_speech_voices)
         bridge.model_progress.connect(self._on_model_progress)
         bridge.settings_changed.connect(self._on_settings_changed)
@@ -1159,6 +1362,7 @@ class MainWindow(QWidget):
         self.ai_switch.set_checked_silently(bool(s.get("ai_enabled", False)))
         self.wake_switch.set_checked_silently(bool(s.get("wake_enabled", True)))
         self.always_switch.set_checked_silently(bool(s.get("always_listen", True)))
+        self._sync_asr_controls(s)
         self.opencode_switch.set_checked_silently(bool(s.get("opencode_enabled", True)))
         self.codex_switch.set_checked_silently(bool(s.get("codex_enabled", True)))
         self.deepai_switch.set_checked_silently(bool(s.get("deepai_enabled", True)))
@@ -1173,7 +1377,7 @@ class MainWindow(QWidget):
         self.startup_switch.set_checked_silently(startup.is_enabled())
         for widget, key, default in (
             (self.timing_start, "speech_start_timeout", 7.0),
-            (self.timing_silence, "speech_trailing_silence", 1.6),
+            (self.timing_silence, "speech_trailing_silence", 1.0),
             (self.timing_max, "speech_max_utterance", 20.0),
             (self.timing_confidence, "speech_min_confidence", 0.30),
         ):
@@ -1195,6 +1399,12 @@ class MainWindow(QWidget):
         self.volume_slider.blockSignals(False)
         self._on_volume_changed(int(s.get("speech_volume", 90)))
 
+        pause = float(s.get("speech_sentence_pause", 1.0) or 0.0)
+        self.pause_slider.blockSignals(True)
+        self.pause_slider.setValue(int(round(max(0.0, min(3.0, pause)) * 10)))
+        self.pause_slider.blockSignals(False)
+        self._on_pause_changed(self.pause_slider.value())
+
         self._sync_engine_combo(s.get("speech_backend", BACKEND_AUTO))
 
         self.size_slider.blockSignals(True)
@@ -1213,6 +1423,7 @@ class MainWindow(QWidget):
         self.sleep_value.setText(f"{int(s.get('face_sleep_after', 300))} s")
 
         self._sync_menu_face_controls(s)
+        self._sync_ai_controls(s)
 
         self.opencode_url.setText(s.get("opencode_base_url", "http://127.0.0.1:4096"))
         details = []
@@ -1244,6 +1455,7 @@ class MainWindow(QWidget):
     def show_page(self, key: str) -> None:
         if key not in self.pages:
             key = "dashboard"
+        self._current_page = key
         self.stack.setCurrentWidget(self.pages[key])
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
@@ -1277,12 +1489,13 @@ class MainWindow(QWidget):
         self.ai_switch.set_checked_silently(bool(s.get("ai_enabled", False)))
         self.wake_switch.set_checked_silently(bool(s.get("wake_enabled", True)))
         self.always_switch.set_checked_silently(bool(s.get("always_listen", True)))
+        self._sync_asr_controls(s)
         self.face_switch.set_checked_silently(bool(s.get("show_face", True)))
         self.expressions_switch.set_checked_silently(bool(s.get("face_expressions", True)))
         self.startup_switch.set_checked_silently(startup.is_enabled())
         for widget, key, default in (
             (self.timing_start, "speech_start_timeout", 7.0),
-            (self.timing_silence, "speech_trailing_silence", 1.6),
+            (self.timing_silence, "speech_trailing_silence", 1.0),
             (self.timing_max, "speech_max_utterance", 20.0),
             (self.timing_confidence, "speech_min_confidence", 0.30),
         ):
@@ -1294,6 +1507,26 @@ class MainWindow(QWidget):
         self._sync_engine_combo(s.get("speech_backend", BACKEND_AUTO))
         self._sync_menu_face_controls(s)
         self._update_mute_labels()
+        self._sync_ai_controls(s)
+
+    def _sync_ai_controls(self, s: dict) -> None:
+        for widget, value in (
+            (self.ai_host, str(s.get("hermes_host", "127.0.0.1"))),
+            (self.ai_port, int(s.get("hermes_port", 8642) or 8642)),
+            (self.ai_model, str(s.get("hermes_model", "hermes-agent"))),
+        ):
+            widget.blockSignals(True)
+            if isinstance(widget, QSpinBox):
+                widget.setValue(value)
+            else:
+                widget.setText(value)
+            widget.blockSignals(False)
+        self.ai_autostart_switch.set_checked_silently(
+            bool(s.get("ai_autostart_backend", True))
+        )
+        self.ai_stream_switch.set_checked_silently(
+            bool(s.get("ai_streaming", True))
+        )
 
     def _on_settings_changed(self, settings: dict) -> None:
         self.sync_controls()
@@ -1310,10 +1543,35 @@ class MainWindow(QWidget):
     def _update_mute_labels(self) -> None:
         if self.runtime.muted:
             self.header_status.setText("Voice muted · monitoring active")
+        dash = getattr(self, "dash_mute", None)
+        if dash is not None:
+            dash.setText("Unmute voice" if self.runtime.muted else "Mute voice")
 
     # =====================================================================
     # status
     # =====================================================================
+    def _queue_status(self, status: dict) -> None:
+        """Coalesce bursts of status updates into one repaint.
+
+        One command publishes five to eight snapshots in a row (heard, match,
+        command, result, activity, speech).  Rendering each one writes ~25
+        labels and a few stylesheets; a 100 ms window keeps the UI smooth and
+        loses nothing a person can perceive.
+        """
+        self._pending_status = dict(status or {})
+        timer = getattr(self, "_status_timer", None)
+        if timer is None:
+            timer = self._status_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(100)
+            timer.timeout.connect(self._flush_status)
+        timer.start()
+
+    def _flush_status(self) -> None:
+        pending = getattr(self, "_pending_status", None)
+        if pending:
+            self.update_statuses(pending)
+
     def update_statuses(self, status: dict) -> None:
         self._status = dict(status or {})
         for key, widget in getattr(self, "stat_widgets", {}).items():
@@ -1392,6 +1650,7 @@ class MainWindow(QWidget):
 
     def _flush_pending_saves(self) -> None:
         """Persist every debounced change immediately (window closing/quit)."""
+        self._remember_geometry()
         pending = list(getattr(self, "_pending_saves", {}).values())
         self._pending_saves = {}
         for timer in pending:
@@ -1448,6 +1707,17 @@ class MainWindow(QWidget):
 
     def _save_volume(self) -> None:
         self._save({"speech_volume": self.volume_slider.value()})
+
+    def _on_pause_changed(self, value: int) -> None:
+        seconds = int(value) / 10.0
+        self.pause_label.setText(f"{seconds:.1f} s")
+        try:
+            self.runtime.speech.set_sentence_pause(seconds)
+        except Exception:
+            pass
+
+    def _save_pause(self) -> None:
+        self._save({"speech_sentence_pause": self.pause_slider.value() / 10.0})
 
     def _preview_voice(self) -> None:
         preview = getattr(self.runtime, "preview_voice", None)
@@ -1596,6 +1866,39 @@ class MainWindow(QWidget):
 
         run_async(self, work, done)
 
+    def _sync_asr_controls(self, s: dict) -> None:
+        combo = getattr(self, "asr_engine_combo", None)
+        if combo is not None:
+            combo.blockSignals(True)
+            position = combo.findData(str(s.get("asr_engine", "auto")))
+            combo.setCurrentIndex(max(0, position))
+            combo.blockSignals(False)
+        for widget, key, default in (
+            (self.agc_switch, "audio_agc", True),
+            (self.noise_switch, "audio_noise_suppression", True),
+            (self.aec_switch, "audio_aec", False),
+        ):
+            widget.set_checked_silently(bool(s.get(key, default)))
+        status = getattr(self, "asr_status", None)
+        if status is not None:
+            reason = engine_reason(self.runtime.settings)
+            if not engine_model_ready(self.runtime.settings):
+                reason += " · model not installed"
+            status.set_text(reason)
+
+    def _on_asr_engine_chosen(self, _index: int) -> None:
+        key = self.asr_engine_combo.currentData()
+        self._save({"asr_engine": str(key or "auto")})
+        self._sync_asr_controls(self.runtime.settings)
+
+    def _save_audio_frontend(self) -> None:
+        self._save({
+            "audio_agc": bool(self.agc_switch.isChecked()),
+            "audio_noise_suppression": bool(self.noise_switch.isChecked()),
+            "audio_aec": bool(self.aec_switch.isChecked()),
+        })
+        self._sync_asr_controls(self.runtime.settings)
+
     def _populate_microphones(self) -> None:
         selected = self.runtime.settings.get("microphone_device")
         self.mic_combo.blockSignals(True)
@@ -1676,17 +1979,27 @@ class MainWindow(QWidget):
         })
 
     def _refresh_model_status(self) -> None:
-        path = resolve_model(self.runtime.settings.get("vosk_model_path"))
-        if model_is_ready(path):
-            self.model_status.set_text(f"Installed · {path.name}")
+        settings = self.runtime.settings
+        if engine_model_ready(settings):
+            self.model_status.set_text(f"Installed · {engine_reason(settings)}")
             self.download_button.setEnabled(False)
             self.download_button.setText("Speech model installed")
-            self.model_note.setText(f"Licence: {MODEL_LICENSE}. Runs entirely offline.")
+            self.model_note.setText("Apache-2.0 model. Runs entirely offline.")
+            return
+        sherpa_selected = str(settings.get("asr_engine") or "auto").lower() == "sherpa"
+        self.model_status.set_text("Not installed · download the free model to use voice")
+        self.download_button.setEnabled(not self._download_active)
+        if sherpa_selected:
+            self.download_button.setText("Download sherpa-onnx model (~250 MB)")
+            self.model_note.setText(
+                f"Apache-2.0 streaming model from the sherpa-onnx project. "
+                f"Saved to {MODELS_DIR}. Vosk remains the fallback."
+            )
         else:
-            self.model_status.set_text("Not installed · download the free model to use voice")
-            self.download_button.setEnabled(not self._download_active)
             self.download_button.setText("Download offline speech model (~40 MB)")
-            self.model_note.setText(f"Apache-2.0 model from alphacephei.com. Saved to {MODELS_DIR}.")
+            self.model_note.setText(
+                f"Apache-2.0 model from alphacephei.com. Saved to {MODELS_DIR}."
+            )
 
     def _download_model(self) -> None:
         if self._download_active:
@@ -1850,35 +2163,87 @@ class MainWindow(QWidget):
         )
 
     def _check_ai_backend(self) -> None:
-        """Probe Hermes without blocking the UI thread."""
+        """Probe Hermes without blocking the UI thread.
+
+        A stopped-but-installed gateway is started automatically, so this
+        button repairs the common "nothing is listening" case instead of only
+        reporting it.
+        """
         self.ai_check_button.setEnabled(False)
         self.ai_status.set_text("Checking the local Hermes server…")
 
         def work():
-            try:
-                status = self.runtime.assistant_backend_status()
-            except Exception:
-                status = "unreachable"
-            QTimer.singleShot(0, lambda: self._ai_probe_done(status))
+            return self.runtime.ai_backend_report(start_if_down=True)
 
-        threading.Thread(target=work, name="talcon-ai-probe", daemon=True).start()
+        run_async(self, work, self._ai_report_done)
 
-    def _ai_probe_done(self, status: str) -> None:
+    def _start_ai_backend(self) -> None:
+        self.ai_start_button.setEnabled(False)
+        self.ai_status.set_text("Starting the local Hermes gateway…")
+
+        def work():
+            return self.runtime.start_ai_backend()
+
+        def done(result) -> None:
+            self.ai_start_button.setEnabled(True)
+            if isinstance(result, Exception):
+                self.ai_status.set_text(f"Could not start Hermes: {result}")
+                return
+            ok, detail = result
+            if ok:
+                self.ai_status.set_text("Hermes is starting — checking it…")
+                QTimer.singleShot(600, self._check_ai_backend)
+            else:
+                self.ai_status.set_text(f"Hermes did not start: {detail}")
+
+        run_async(self, work, done)
+
+    def _save_ai_backend(self) -> None:
+        self._save({
+            "hermes_host": self.ai_host.text().strip() or "127.0.0.1",
+            "hermes_port": int(self.ai_port.value()),
+            "hermes_model": self.ai_model.text().strip() or "hermes-agent",
+        })
+        self.ai_status.set_text("AI address saved — testing it now…")
+        self._check_ai_backend()
+
+    def _ai_report_done(self, report) -> None:
         self.ai_check_button.setEnabled(True)
         try:
-            if status == "off":
+            if isinstance(report, Exception):
+                self.ai_status.set_text(f"Could not check the AI backend: {report}")
+                return
+            report = dict(report or {})
+            listening = bool(report.get("listening"))
+            reachable = bool(report.get("reachable"))
+            if not bool(self.runtime.settings.get("ai_enabled", False)):
                 self.ai_status.set_text("AI is off — turn it on to test the connection.")
-            elif status == "ready":
-                self.ai_status.set_text("Connected to Hermes on 127.0.0.1 — AI is ready.")
-            elif status == "unconfigured":
+            elif reachable:
+                version = str(report.get("version") or "").strip()
+                models = ", ".join(report.get("models") or []) or "hermes-agent"
+                suffix = f" (v{version})" if version else ""
                 self.ai_status.set_text(
-                    "No usable Hermes API key found in your local Hermes setup."
+                    f"Connected to Hermes on {report.get('host')}:"
+                    f"{report.get('port')}{suffix} — model {models}."
+                )
+            elif listening:
+                self.ai_status.set_text(
+                    "Something is listening, but Hermes rejected the request: "
+                    f"{report.get('detail') or 'unknown reason'}"
+                )
+            elif bool(report.get("installed")):
+                self.ai_status.set_text(
+                    "Hermes is installed but its gateway is not running."
                 )
             else:
                 self.ai_status.set_text(
-                    "Hermes is not reachable on 127.0.0.1 — start it with the "
-                    "Hermes gateway and try again."
+                    "No Hermes installation was found on this PC."
                 )
+            home = str(report.get("home") or "")
+            self.ai_detail.setText(
+                f"Install: {home or 'not found'} · Launcher: "
+                f"{report.get('launcher') or 'none'}"
+            )
         except RuntimeError:
             # The window (or its labels) may already be gone.
             pass

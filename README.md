@@ -1,4 +1,4 @@
-# TALCON — local Windows desktop assistant (v2.3.0)
+# TALCON — local Windows desktop assistant (v2.4.0)
 
 TALCON is a local-first Windows 10/11 assistant with an animated face companion,
 a 12-section control center, editable modes, fully offline wake-word and command
@@ -52,7 +52,15 @@ falling back to a robotic voice.
   activate modes, enable/disable startup and exit.
 - **Voice (100% offline):**
   - Vosk wake-word detection for **“TALCON”**.
-  - Vosk offline command recognition.
+  - Vosk offline command recognition by default, with an optional
+    **sherpa-onnx** streaming transducer behind the same interface. The
+    engine is a setting (`auto`, `vosk` or `sherpa`) and Vosk remains the
+    automatic fallback when the package or model is missing.
+  - Shared audio conditioning before every recogniser: automatic gain,
+    streaming noise suppression and optional reference echo suppression.
+    The VAD still measures the raw microphone level.
+  - Optional **faster-whisper** second pass for long questions only
+    ("explain…", "what is…"); short commands stay on the streaming model.
   - **Kokoro-82M** neural speech only (free, Apache-2.0, CPU, about 118 MB).
     It loads while speaking and unloads after 90 seconds idle.
   - Saying “TALCON” answers “Yes, sir?”, then take a command.
@@ -104,7 +112,32 @@ falling back to a robotic voice.
 
 ## Recent changes in this version
 
-- **Kokoro is the only speech engine.** The Microsoft SAPI/WinRT backends,
+- **The AI backend now starts itself.** If Hermes is installed but its gateway
+  is not running, TALCON launches the real Hermes gateway, waits for
+  `127.0.0.1:8642` and then verifies the API key. A stopped gateway no longer
+  produces "cannot reach the backend" for an ordinary question.
+- **Streamed AI answers.** Chat completions are streamed, and the first
+  sentence is spoken while the rest is still being generated. History records
+  the full answer exactly once.
+- **AI details in Voice Settings:** host, port and model fields, an automatic
+  start switch, a streaming switch, "Start Hermes" and "Test connection".
+- **User data moved out of OneDrive.** Settings, logs and cron history now live
+  in `%LOCALAPPDATA%\TALCON` (existing files are migrated once). Models stay in
+  the project folder.
+- **Faster UI:** the slow `schtasks.exe` startup probe is cached, microphone
+  enumeration is cached, status updates are coalesced, the duplicate window
+  stylesheet was removed and no-op settings saves no longer touch the disk.
+- **Quieter when idle:** the face animates at 30 FPS only while it is doing
+  something, the preview stops when hidden, the cron page stops polling and
+  the preview window only follows the avatar while it has something to show.
+- **Responsive voice:** smaller audio blocks and a 1.0 s trailing-silence
+  default cut roughly half a second from every spoken command.
+- The window remembers its size, position and last page; `Ctrl+1…9` jump to a
+  section, `Esc` hides to the tray, and `Ctrl+Alt+Space` starts listening from
+  any application (system-wide hotkey).
+- Background work (speech, recognition, AI, monitors) runs below normal
+  priority; native crashes are recorded in `logs/crash.log` via faulthandler.
+- Kokoro is the only speech engine; the Microsoft SAPI/WinRT backends,
   Narrator probing and every Windows-voice fallback were removed.
 - Saved settings are migrated to Kokoro automatically; old values such as
   `windows`, `sapi` or `auto` now normalise to `kokoro`.
@@ -164,11 +197,62 @@ uses `assets/talcon_face.gif` (circular face only, transparent surroundings).
 Adjust size and position in Appearance or by dragging. The overlay is
 click-through outside the circle so it never blocks clicks.
 
+## Speech recognition engines and measurement
+
+The recognition engine is selected in **Voice Settings → Recognition engine**
+or with `asr_engine` in settings:
+
+- `auto` — the measured, reliable Vosk command path. Installing sherpa-onnx
+  does not silently change command behaviour.
+- `vosk` — the bundled small English model only.
+- `sherpa` — explicitly opt in to sherpa-onnx; if it cannot load, the voice
+  pipeline logs the reason and continues on Vosk instead of losing the
+  microphone.
+
+Install the optional engine and model from a terminal:
+
+```bat
+.venv\Scripts\pip.exe install sherpa-onnx
+.venv\Scripts\python.exe -m talcon.model_setup --sherpa
+```
+
+The benchmark decodes identical audio with every available engine and reports
+word error rate and latency at simulated 0.5 m, 2 m and 3 m distances:
+
+```bat
+.venv\Scripts\python.exe scripts\benchmark_speech.py
+.venv\Scripts\python.exe scripts\benchmark_speech.py --engine both --distances 0.5,2,3
+.venv\Scripts\python.exe scripts\benchmark_speech.py --engine parakeet --parakeet-model models\parakeet
+```
+
+`--engine parakeet` is experimental and batch-only; it is never selected by
+the live voice loop. Results are written to `logs/speech_benchmark.json`
+(WER, action accuracy, mean/p95 latency, real-time factor and the conditioned
+audio settings used).
+
+A local run of the synthetic command corpus (Kokoro speech, AGC + noise
+suppression, 55 utterances per distance) measured:
+
+| Engine | WER 0.5 m | WER 2 m | WER 3 m | Action accuracy 0.5 m | Mean latency |
+| --- | --- | --- | --- | --- | --- |
+| Vosk small | 0.29 | 0.52 | 0.52 | 0.73 | ~0.11 s |
+| sherpa-onnx zipformer | 0.56 | 0.66 | 0.71 | 0.07 | ~0.30 s |
+
+That corpus is command-heavy and synthetic, so Vosk wins there because its
+phrase list biases decoding. Run the benchmark on your own microphone and
+phrasing before changing `asr_engine`; sherpa-onnx is still useful for
+free-form speech, and Vosk remains the safe automatic fallback.
+
+The optional long-question pass needs `faster-whisper` and is disabled by
+default (`long_question_whisper`). It never runs for commands: only transcripts
+starting with phrases such as "explain", "what is" or "tell me about" are
+eligible.
+
 ## Engineering notes
 
 - Tested on this machine: Python 3.14.5, PySide6 6.12, vosk 0.3.45,
   kokoro-onnx 0.4.7, onnxruntime 1.32.
-- Full test suite: **708 pytest tests pass**.
+- Full test suite: **737 pytest tests pass**.
 - Verified on-machine: real wake-word detections, real OpenCode SSE
   connection, real Codex log parsing, audible Kokoro playback and
   install/launch/uninstall round-trips.
@@ -179,8 +263,10 @@ click-through outside the circle so it never blocks clicks.
   cannot recover events missed while disconnected.
 - All monitor connections are restricted to `127.0.0.1` / localhost.
 - Run TALCON as a normal user, never as Administrator.
-- Settings live in `config/settings.json`, rotating logs in `logs/`, and the
-  models in `models/` (Vosk and Kokoro, both Apache License 2.0).
+- Settings, modes, cron jobs and rotating logs live in
+  `%LOCALAPPDATA%\TALCON` (the project's `config/` folder is only a legacy
+  location that is migrated once); the offline models stay in `models/`
+  (Vosk and Kokoro, both Apache License 2.0).
 
 ## Folder layout
 
@@ -196,7 +282,7 @@ TALCON_Assistant/
   models/                 # offline Vosk + Kokoro models
   talcon/                   # UI, face overlay, voice, intent, AI, monitors
   scripts/                # startup shortcut, speech benchmark
-  tests/                  # 708 automated tests (pytest)
+  tests/                  # 737 automated tests (pytest)
   USER_GUIDE.md           # full user guide and feature status
   setup.ps1               # venv + dependency installation
   main.py                 # entry point

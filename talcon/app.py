@@ -32,6 +32,8 @@ SERVER_NAME = "TALCON_Assistant_2_0"
 _ERROR_ALREADY_EXISTS = 183
 #: Held open for the whole process lifetime; closing it releases the lock.
 _instance_mutex = None
+#: Kept alive for the process lifetime (RegisterHotKey registration).
+_hotkey = None
 
 
 def _claim_instance_mutex() -> bool:
@@ -512,6 +514,9 @@ def main() -> None:
         return
 
     setup_logging()
+    from .config import migrate_legacy_data
+
+    migrate_legacy_data()
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception:
@@ -542,4 +547,11 @@ def main() -> None:
 
     log.info("Launching TALCON (startup=%s)", args.startup)
     application = TalconApplication(qt, startup_mode=args.startup)
+    global _hotkey
+    try:
+        from .hotkey import install
+
+        _hotkey = install(qt, application.runtime.listen_now)
+    except Exception:
+        log.debug("Global listen hotkey is unavailable", exc_info=True)
     sys.exit(application.run())

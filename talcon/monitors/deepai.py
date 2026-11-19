@@ -39,7 +39,7 @@ FAILURE_STATES = {"failed", "error"}
 INTERRUPTED_STATES = {"cancelled", "canceled", "interrupted", "stopped", "aborted"}
 
 MAX_RUNS = 40
-POLL_SECONDS = 2.0
+POLL_SECONDS = 4.0
 
 
 def deepai_home() -> Path:

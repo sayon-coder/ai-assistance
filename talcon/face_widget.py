@@ -81,7 +81,8 @@ class FaceWidget(QWidget):
         self.setFixedSize(self._size, self._size)
         self._apply_mask()
         self._timer = QTimer(self)
-        self._timer.setInterval(FRAME_MS)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._timer.setInterval(self._frame_interval())
         self._timer.timeout.connect(self._tick)
         self._update_tooltip()
         self._restore_position()
@@ -158,6 +159,26 @@ class FaceWidget(QWidget):
             log.exception("Could not save face position")
 
     # -- animation ---------------------------------------------------------
+    def _frame_interval(self) -> int:
+        """30 FPS only while something is happening; slower when idle/asleep.
+
+        A constant 30 FPS repaint while the face is asleep keeps the CPU (and
+        the fan) busy for no visible benefit on a laptop.
+        """
+        name = getattr(self, "_expression_name", "neutral")
+        if name == "sleeping":
+            return 250
+        if name == "sleepy":
+            return 120
+        if name in {"neutral", "blinking", "look_left", "look_right", "look_up"}:
+            return 66
+        return FRAME_MS
+
+    def _sync_frame_interval(self) -> None:
+        interval = self._frame_interval()
+        if self._timer.interval() != interval:
+            self._timer.setInterval(interval)
+
     def _update_tooltip(self) -> None:
         labels = {
             "neutral": "Idle", "blinking": "Idle", "sleepy": "Sleepy",
@@ -222,6 +243,7 @@ class FaceWidget(QWidget):
         )
         self._update_tooltip()
         self.expression_changed.emit(self._expression_name)
+        self._sync_frame_interval()
         self._start_timer()
         self.update()
 
@@ -237,6 +259,7 @@ class FaceWidget(QWidget):
         )
         self._update_tooltip()
         self.expression_changed.emit(self._expression_name)
+        self._sync_frame_interval()
         self._start_timer()
         self.update()
 
@@ -257,6 +280,7 @@ class FaceWidget(QWidget):
         if self._expression.current_name != self._expression_name:
             self._expression_name = self._expression.current_name
             self._update_tooltip()
+            self._sync_frame_interval()
             self.expression_changed.emit(self._expression_name)
 
         factor = 1.0 - math.exp(-dt * 12.0)

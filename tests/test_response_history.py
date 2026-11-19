@@ -100,9 +100,12 @@ def test_utterance_callback_receives_the_complete_text():
         output.say(long_text)
         assert wait_for(lambda: seen)
         assert seen == [long_text]
-        assert wait_for(lambda: backend.said)
-        # The engine still gets its bounded form, so playback is unchanged.
-        assert len(backend.said[0]) == 700
+        assert output.wait_until_quiet(5.0)
+        # The engine gets a bounded, sentence-sized form: pieces are spoken in
+        # order and together cover exactly the same 700-character excerpt.
+        assert backend.said
+        assert "".join(backend.said) == "A" * 700
+        assert all(len(piece) <= 200 for piece in backend.said)
     finally:
         output.stop()
 

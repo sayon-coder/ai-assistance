@@ -296,7 +296,7 @@ def turn_database_path():
 
 
 class CodexMonitor:
-    POLL_SECONDS = 1.5
+    POLL_SECONDS = 4.0
 
     def __init__(self, on_event, status_callback=None):
         self.on_event = on_event

@@ -93,6 +93,20 @@ class StubHandler(BaseHTTPRequestHandler):
         body = self._json_body()
         self.server.requests.append((self.path, dict(self.headers), body))
         if self.path == "/v1/chat/completions":
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for piece in ("chat ", "answer"):
+                    chunk = {"choices": [{"delta": {"content": piece}}]}
+                    self.wfile.write(
+                        f"data: {json.dumps(chunk)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+                return
             self._send(200, {"choices": [{"message": {
                 "role": "assistant", "content": "chat answer"}}]})
         elif self.path == "/v1/runs":
@@ -189,6 +203,24 @@ def test_health_and_models_and_capabilities(client):
 def test_chat_completion_returns_message_text(client):
     answer = client.chat([{"role": "user", "content": "hi"}])
     assert answer == "chat answer"
+
+
+def test_chat_stream_reports_text_as_it_arrives(client):
+    seen: list[str] = []
+    answer = client.chat_stream(
+        [{"role": "user", "content": "hi"}], on_delta=seen.append
+    )
+    assert answer == "chat answer"
+    assert seen == ["chat ", "answer"]
+
+
+def test_keyless_loopback_client_is_opt_in():
+    with pytest.raises(HermesConfigError):
+        HermesClient(env={}, home="Z:/definitely-not-here")
+    client = HermesClient(env={}, home="Z:/definitely-not-here",
+                          allow_keyless=True)
+    assert client.key_source == "none"
+    assert client.redact("plain text") == "plain text"
 
 
 def test_run_submission_status_stop_and_approval(client, stub_server):
