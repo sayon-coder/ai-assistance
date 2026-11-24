@@ -40,13 +40,13 @@ def dispose_widgets(qapp):
 
 
 def test_palette_is_light_grey_and_transparent_at_the_window_edge():
-    assert theme.BG == "#A9A9A9"
-    assert theme.SIDEBAR == "#B3B3B3"
-    assert theme.SURFACE == "#D8D8D8"
-    assert theme.INPUT == "#F1F1F1"
-    assert theme.BORDER == "#9A9A9A"
-    assert theme.TEXT == "#1C1C1C"
-    assert theme.MUTED == "#4F4F4F"
+    assert theme.BG == "#EEF1F5"
+    assert theme.SIDEBAR == "#F7F9FC"
+    assert theme.SURFACE == "#FFFFFF"
+    assert theme.INPUT == "#FFFFFF"
+    assert theme.BORDER == "#E3E7ED"
+    assert theme.TEXT == "#14181F"
+    assert theme.MUTED == "#5B6472"
     assert "QFrame#Shell" in theme.STYLESHEET
     assert f"border: 1px solid {theme.WINDOW_BORDER};" in theme.STYLESHEET
     assert "border-radius: 16px;" in theme.STYLESHEET

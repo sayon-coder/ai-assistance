@@ -48,6 +48,13 @@ def _short_moment(value: str) -> str:
     return moment.strftime("%a %d %b, %I:%M %p").replace(" 0", " ")
 
 
+def _section(text: str) -> QLabel:
+    """A small caption that groups a run of related fields."""
+    label = QLabel(text.upper())
+    label.setObjectName("Section")
+    return label
+
+
 def _stretch() -> QWidget:
     holder = QWidget()
     holder.setFixedWidth(1)
@@ -63,6 +70,18 @@ def _labelled(text: str, widget: QWidget) -> QWidget:
     label.setObjectName("Muted")
     layout.addWidget(label)
     layout.addWidget(widget)
+    return holder
+
+
+def _actions(*buttons: QWidget, spacing: int = 8) -> QWidget:
+    """Right-aligned row for a card's action buttons."""
+    holder = QWidget()
+    layout = QHBoxLayout(holder)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(spacing)
+    layout.addStretch(1)
+    for button in buttons:
+        layout.addWidget(button)
     return holder
 
 
@@ -118,22 +137,26 @@ class CronJobsPage(QWidget):
         self.form_title = QLabel("New job")
         self.form_title.setObjectName("CardTitle")
         card.add(self.form_title)
+        card.add_spacing(2)
 
         self.quick_input = QLineEdit()
         self.quick_input.setPlaceholderText("Open Chrome every day at 9 AM")
         self.quick_input.returnPressed.connect(self._fill_from_text)
         quick = QPushButton("Fill from description")
         quick.clicked.connect(self._fill_from_text)
+        card.add(_section("Start from a sentence"))
         card.add(_labelled(
             "Natural-language description (optional)", self.quick_input
         ))
-        card.add(row(quick, _stretch(), spacing=8))
+        card.add(_actions(quick, spacing=8))
         card.add(footnote(
             "Type a sentence such as “Open Chrome every day at 9 AM”, then press "
             "Fill from description. It only fills the fields below; review them and "
             "press Authorize to create the job."
         ))
 
+        card.add_spacing(6)
+        card.add(_section("Job details"))
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("For example: Morning browser")
         card.add(_labelled("Job name", self.name_input))
@@ -163,6 +186,8 @@ class CronJobsPage(QWidget):
         card.add(self.mode_row)
         self._sync_action_fields()
 
+        card.add_spacing(6)
+        card.add(_section("Schedule"))
         self.schedule_combo = QComboBox()
         self.schedule_combo.addItem("One time", "once")
         self.schedule_combo.addItem("Daily", "daily")
@@ -189,7 +214,9 @@ class CronJobsPage(QWidget):
         self.cancel_button = QPushButton("Cancel edit")
         self.cancel_button.clicked.connect(self._cancel_edit)
         self.cancel_button.setVisible(False)
-        card.add(row(self.create_button, self.cancel_button, _stretch(), spacing=8))
+        card.add(_actions(
+            self.create_button, self.cancel_button, spacing=8
+        ))
 
         self.error_label = QLabel("")
         self.error_label.setObjectName("Bad")

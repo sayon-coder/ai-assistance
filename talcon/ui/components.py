@@ -20,8 +20,8 @@ class Card(QFrame):
         super().__init__(parent)
         self.setObjectName("Card")
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(18, 16, 18, 16)
-        self.body.setSpacing(10)
+        self.body.setContentsMargins(22, 18, 22, 18)
+        self.body.setSpacing(12)
         if title:
             label = QLabel(title)
             label.setObjectName("CardTitle")
@@ -31,6 +31,9 @@ class Card(QFrame):
             sub.setObjectName("CardSub")
             sub.setWordWrap(True)
             self.body.addWidget(sub)
+            # A little air after the subtitle so the form does not start on
+            # top of the card's own explanation.
+            self.body.addSpacing(2)
 
     def add(self, widget: QWidget, stretch: int = 0):
         self.body.addWidget(widget, stretch)
@@ -81,7 +84,7 @@ class Switch(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(Qt.PenStyle.NoPen)
-        off = QColor("#8A8A8A")
+        off = QColor("#B4BCC9")
         on = QColor(theme.ACCENT)
         track = QColor(
             int(off.red() + (on.red() - off.red()) * self._pos),
